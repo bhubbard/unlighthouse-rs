@@ -87,6 +87,7 @@ export default defineConfig(({ mode }) => ({
   },
 
   build: {
+    sourcemap: true,
     rolldownOptions: {
       external: [
         '@tailwindcss/oxide',

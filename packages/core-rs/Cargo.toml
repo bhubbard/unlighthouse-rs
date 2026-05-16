@@ -1,0 +1,81 @@
+[package]
+name = "unlighthouse-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of unlighthouse core: URL discovery, job orchestration, API server, and CI reporting"
+default-run = "unlighthouse-rs"
+
+[[bin]]
+name = "unlighthouse-rs"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP client — use rustls so we don't need system OpenSSL dev headers
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls", "charset", "http2"] }
+
+# HTML parsing (used during URL discovery / static crawl)
+scraper = "0.20"
+
+# Two browser backends — selectable at runtime via --browser flag.
+# headless_chrome: sync API, stable with all Chrome versions (default)
+# chromiumoxide:   async/tokio-native CDP (may crash on some Chrome internal events)
+headless_chrome = "1"
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+
+# Web server
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["fs", "cors", "trace", "compression-full"] }
+
+
+# XML parsing for sitemaps
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Hashing (for route IDs)
+md5 = "0.7"
+
+# URL parsing
+url = "2"
+
+# CSV writing
+csv = "1"
+
+# Glob pattern matching (replaces hand-rolled DP in discovery/routes.rs)
+glob = "0.3"
+
+# Concurrency utilities
+tokio-util = { version = "0.7", features = ["full"] }
+
+# Process detection
+num_cpus = "1"
+
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Futures utilities (needed for chromiumoxide handler StreamExt)
+futures = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

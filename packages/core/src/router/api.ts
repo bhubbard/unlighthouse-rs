@@ -13,6 +13,12 @@ export async function createApi(app: App): Promise<Router> {
   const { ws, resolvedConfig, runtimeSettings, hooks } = useUnlighthouse()
 
   const router = createRouter()
+  
+  // Security headers
+  app.use(defineEventHandler((event) => {
+    setResponseHeader(event, 'Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload')
+    setResponseHeader(event, 'Cross-Origin-Opener-Policy', 'same-origin')
+  }))
 
   // Handle typo redirect
   router.get('/__lighthouse/', defineEventHandler(event =>

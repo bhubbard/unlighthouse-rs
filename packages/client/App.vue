@@ -131,7 +131,8 @@ const getDropdownActions = computed(() => (report) => {
   return [actions]
 })
 
-useTitle(`${website.replace(/https?:\/\/(www.)?/, '')} | Unlighthouse`)
+const _appName = (window as any).__unlighthouse_payload?.appName ?? 'Unlighthouse'
+useTitle(`${website.replace(/https?:\/\/(www.)?/, '')} | ${_appName}`)
 
 const tabListEl = ref<HTMLElement | null>(null)
 function onTabKeydown(e: KeyboardEvent, key: number) {
@@ -159,7 +160,7 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
   <UApp>
     <div class="text-gray-700 dark:text-gray-200 overflow-y-hidden max-h-screen h-screen grid grid-rows-[min-content_1fr]">
       <NavBar />
-      <main class="xl:flex mt-2 mb-2">
+      <main class="xl:flex mt-2 mb-2" :aria-busy="shouldShowWaitingState">
         <div class="flex justify-between max-h-[95%] flex-col xl:ml-3 mx-3 mr-0 w-full xl:mr-5 xl:w-[250px] xl:mb-0">
           <div>
             <div ref="tabListEl" role="tablist" aria-orientation="vertical" class="xl:block xl:space-x-0 flex space-x-2 mb-3">
@@ -189,23 +190,25 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
             </div>
             <div v-if="dynamicSampling" class="text-sm opacity-70 mt-3">
               <p>Dynamically sampling is enabled, not all pages are being scanned.</p>
-              <p><a href="https://unlighthouse.dev/guide/guides/dynamic-sampling" target="_blank" class="underline">Learn more</a></p>
+              <p><a href="https://unlighthouse.dev/guide/guides/dynamic-sampling" target="_blank" class="underline inline-block p-2 -m-2">Learn more about dynamic sampling</a></p>
             </div>
           </div>
           <div class="hidden xl:block">
-            <LighthouseThreeD v-if="!isStatic" class="mb-7" />
+            <div v-if="!isStatic" class="min-h-[228px]">
+              <LighthouseThreeD class="mb-7" />
+            </div>
             <div class="px-2 text-center xl:text-left">
               <div class="text-xs opacity-75 xl:mt-4">
-                <a href="https://unlighthouse.dev" target="_blank" class="underline hover:no-underline">Documentation</a>
+                <a href="https://unlighthouse.dev" target="_blank" class="underline hover:no-underline inline-block p-1 -m-1">Documentation</a>
                 <btn-action v-if="!isStatic" class="underline hover:no-underline ml-3" @click="openDebugModal">
                   Debug
                 </btn-action>
               </div>
               <div class="text-xs opacity-75 xl:mt-4">
-                Made with <UIcon name="i-simple-line-icons-heart" title="Love" class="inline" aria-label="love" /> by <a href="https://twitter.com/harlan_zw" target="_blank" class="underline hover:no-underline">@harlan_zw</a>
+                Made with <UIcon name="i-simple-line-icons-heart" title="Love" class="inline" aria-label="love" /> by <a href="https://twitter.com/harlan_zw" target="_blank" class="underline hover:no-underline inline-block p-1 -m-1">@harlan_zw</a>
               </div>
               <div class="text-xs opacity-50 xl:mt-4 mt-1">
-                Portions of this report use Lighthouse. For more information visit <a href="https://developers.google.com/web/tools/lighthouse" class="underline hover:no-underline">here</a>.
+                Portions of this report use Lighthouse. For more information visit the <a href="https://developers.google.com/web/tools/lighthouse" class="underline hover:no-underline inline-block p-1 -m-1">Lighthouse documentation</a>.
               </div>
             </div>
           </div>
@@ -397,6 +400,7 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
                       size="sm"
                       color="neutral"
                       variant="ghost"
+                      aria-label="Open actions menu"
                     />
                   </UDropdownMenu>
                 </template>
@@ -448,14 +452,14 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
         <div class="px-2 text-center xl:text-left">
           <div class="flex items-center justify-around">
             <div class="text-xs opacity-75 xl:mt-4">
-              <a href="https://unlighthouse.dev" target="_blank" class="underline">Unlighthouse</a>
+              <a href="https://unlighthouse.dev" target="_blank" class="underline inline-block p-2 -m-2">Unlighthouse</a>
             </div>
             <div class="text-xs opacity-75 xl:mt-4">
-              Made with <UIcon name="i-simple-line-icons-heart" title="Love" class="inline" aria-label="love" /> by <a href="https://twitter.com/harlan_zw" target="_blank" class="underline">@harlan_zw</a>
+              Made with <UIcon name="i-simple-line-icons-heart" title="Love" class="inline" aria-label="love" /> by <a href="https://twitter.com/harlan_zw" target="_blank" class="underline inline-block p-2 -m-2">@harlan_zw</a>
             </div>
           </div>
           <div class="text-xs opacity-50 xl:mt-4 mt-1">
-            Portions of this report use Lighthouse. For more information visit <a href="https://developers.google.com/web/tools/lighthouse" class="underline">here</a>.
+            Portions of this report use Lighthouse. For more information visit the <a href="https://developers.google.com/web/tools/lighthouse" class="underline inline-block p-2 -m-2">Lighthouse documentation</a>.
           </div>
         </div>
       </footer>

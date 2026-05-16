@@ -6,7 +6,8 @@ const timeRemaining = computed(() => {
   return useHumanDuration(scanMeta.value.monitor.timeRemaining)
 })
 
-const version = __UNLIGHTHOUSE_VERSION__
+const version = (window as any).__unlighthouse_payload?.version ?? __UNLIGHTHOUSE_VERSION__
+const appName = (window as any).__unlighthouse_payload?.appName ?? 'Unlighthouse'
 
 const favIcon = computed(() => {
   if (!scanMeta.value?.favicon)
@@ -19,12 +20,12 @@ const favIcon = computed(() => {
 </script>
 
 <template>
-  <nav class="bg-white dark:bg-transparent font-light border-b border-main flex items-center gap-4 children:my-auto px-3 md:px-6 py-2 ">
+  <nav class="bg-white dark:bg-transparent font-light border-b border-main flex items-center gap-4 children:my-auto px-3 md:px-6 py-2 min-h-[60px]">
     <a class="text-md font-medium text-teal-700 dark:text-teal-200 font-mono items-center hidden md:flex cursor-pointer" href="https://unlighthouse.dev" target="_blank">
       <img :src="basePath && basePath !== '/' ? `${basePath}assets/logo-light.svg` : 'assets/logo-light.svg'" height="24" width="24" class="w-[24px] h-[24px] mr-2 hidden dark:block" alt="Unlighthouse logo">
       <img :src="basePath && basePath !== '/' ? `${basePath}assets/logo-dark.svg` : 'assets/logo-dark.svg'" height="24" width="24" class="w-[24px] h-[24px] mr-2 block dark:hidden" alt="Unlighthouse logo">
       <div class="flex flex-col">
-        <span>Unlighthouse</span>
+        <span>{{ appName }}</span>
         <span class="text-xs text-gray-500 dark:text-gray-400 font-normal">v{{ version }}</span>
       </div>
     </a>
@@ -73,6 +74,7 @@ const favIcon = computed(() => {
             color="gray"
             variant="ghost"
             :loading="isRescanSiteRequestRunning"
+            aria-label="Site actions"
           />
         </UDropdownMenu>
       </div>
@@ -103,12 +105,13 @@ const favIcon = computed(() => {
     <div class="hidden md:flex-auto" />
     <btn-icon
       class="icon-btn text-lg"
-      href="https://github.com/harlan-zw/unlighthouse"
+      href="https://github.com/bhubbard/unlighthouse-rs"
       target="_blank"
+      aria-label="GitHub"
     >
       <UIcon name="i-carbon-logo-github" />
     </btn-icon>
-    <btn-icon class="text-lg cursor-pointer" title="Toggle Dark Mode" @click="toggleDark()">
+    <btn-icon class="text-lg cursor-pointer" title="Toggle Dark Mode" aria-label="Toggle dark mode" @click="toggleDark()">
       <UIcon v-if="isDark" name="i-carbon-moon" />
       <UIcon v-else name="i-carbon-sun" />
     </btn-icon>

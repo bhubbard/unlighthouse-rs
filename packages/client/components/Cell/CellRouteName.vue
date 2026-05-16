@@ -36,7 +36,7 @@ const fetchTime = computed(() => {
 })
 
 const thumbnail = computed(() => {
-  const mobileProps = device === 'mobile' ? { class: 'w-[68px] h-[112px]' } : { class: 'h-[82px] w-[112px]' }
+  const mobileProps = device === 'mobile' ? { class: 'w-[68px] h-[112px] object-cover', width: 68, height: 112 } : { class: 'h-[82px] w-[112px] object-cover', width: 112, height: 82 }
 
   // Check if report exists before trying to resolve artifact paths
   if (!props.report) {
@@ -61,7 +61,7 @@ const thumbnail = computed(() => {
     <modal-trigger v-if="report.tasks.runLighthouseTask === 'completed'">
       <template #trigger>
         <btn-action class="hidden md:block" :style="{ flex: `0 0 ${device === 'mobile' ? '67' : '112'}px` }" title="Open Full Page Screenshot">
-          <img v-bind="thumbnail" loading="lazy" height="82" width="112">
+          <img v-bind="thumbnail" loading="lazy" alt="screenshot">
         </btn-action>
       </template>
       <template #modal>

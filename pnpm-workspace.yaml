@@ -99,3 +99,9 @@ packageExtensions:
     peerDependenciesMeta:
       puppeteer:
         optional: true
+
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  puppeteer: false
+  vue-demi: true

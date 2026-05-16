@@ -1,0 +1,286 @@
+use anyhow::Result;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::process::Command;
+use tracing::{debug, error, info, warn};
+
+use crate::config::Config;
+use crate::discovery::routes::normalise_route;
+use crate::server::api::broadcast_and_update;
+use crate::server::AppState;
+use crate::types::{
+    LighthouseCategoryScore, LighthouseReport, RouteReport, TaskMap, TaskStatus, WsEvent,
+};
+
+use super::browser::BrowserHandle;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build an initial RouteReport with all tasks set to Waiting.
+pub fn create_route_report(route: &crate::types::NormalisedRoute, config: &Config) -> RouteReport {
+    let artifact_path = PathBuf::from(&config.output_path)
+        .join(sanitise_hostname(&config.site))
+        .join(&route.id);
+    let artifact_url = format!("/{}/{}/", sanitise_hostname(&config.site), &route.id);
+
+    RouteReport {
+        report_id: route.id.clone(),
+        route: route.clone(),
+        artifact_path: artifact_path.to_string_lossy().to_string(),
+        artifact_url,
+        tasks: TaskMap {
+            inspect_html_task: TaskStatus::Waiting,
+            run_lighthouse_task: TaskStatus::Waiting,
+        },
+        report: None,
+        seo: None,
+    }
+}
+
+fn sanitise_hostname(site: &str) -> String {
+    url::Url::parse(site)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+        .replace(':', "_")
+}
+
+// ── Per-route processing ──────────────────────────────────────────────────────
+
+/// Process a single route end-to-end: HTML inspection then Lighthouse audit.
+///
+/// Steps:
+/// 1. Acquire a concurrency permit from `AppState::semaphore` (blocks until a
+///    worker slot is free).
+/// 2. Fetch the page via the selected [`BrowserHandle`] backend to extract SEO
+///    metadata and discover internal links for further crawling.
+/// 3. Invoke the Lighthouse Node.js subprocess to produce performance,
+///    accessibility, best-practices, and SEO scores.
+/// 4. Broadcast status updates over WebSocket after each step so the dashboard
+///    reflects live progress.
+///
+/// Newly discovered links are fed back into `AppState::work_tx`, subject to the
+/// `max_routes` cap. The cap is enforced under a single write-lock acquisition
+/// to avoid TOCTOU races when multiple workers discover links simultaneously.
+///
+/// # Panics
+/// Panics if the semaphore is closed, which should never happen during normal
+/// operation (the semaphore lives as long as `AppState`).
+pub async fn process_route(
+    route: crate::types::NormalisedRoute,
+    state: Arc<AppState>,
+    browser: BrowserHandle,
+) {
+    let config = Arc::clone(&state.config);
+
+    // Acquire a concurrency permit before doing any work.
+    // Held for the full duration of this route's processing; dropped on return.
+    let permit = state.semaphore.acquire().await.expect("semaphore closed");
+
+    // ── Register the route ────────────────────────────────────────────────────
+    let mut report = create_route_report(&route, &config);
+    {
+        let mut reports = state.route_reports.write().await;
+        reports.insert(route.id.clone(), report.clone());
+    }
+    broadcast_and_update(&state, WsEvent::TaskAdded(report.clone())).await;
+
+    // ── Step 1: HTML inspection ───────────────────────────────────────────────
+    report.tasks.inspect_html_task = TaskStatus::InProgress;
+    broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
+
+    match browser.inspect_html(&route.url).await {
+        Ok((seo, discovered_links)) => {
+            report.seo = Some(seo);
+            report.tasks.inspect_html_task = TaskStatus::Completed;
+
+            // Feed newly discovered internal links back into the work queue.
+            // Acquire the lock once for the whole batch to avoid TOCTOU races
+            // on the max_routes cap and to reduce lock contention.
+            if config.scanner.crawler {
+                let max = config.scanner.max_routes.unwrap_or(usize::MAX);
+                let mut reports = state.route_reports.write().await;
+                for href in discovered_links {
+                    if reports.len() >= max {
+                        break;
+                    }
+                    let new_route = normalise_route(&href, &config.site);
+                    if !reports.contains_key(&new_route.id) {
+                        // Pre-register so the next iteration sees the slot taken
+                        // even before the worker picks it up.
+                        reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
+                        let _ = state.work_tx.send(new_route).await;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(url = %route.url, error = %e, "HTML inspection failed");
+            report.tasks.inspect_html_task = TaskStatus::Failed;
+        }
+    }
+
+    {
+        let mut reports = state.route_reports.write().await;
+        reports.insert(route.id.clone(), report.clone());
+    }
+    broadcast_and_update(&state, WsEvent::TaskComplete(report.clone())).await;
+
+    // ── Step 2: Lighthouse audit (Node.js subprocess) ─────────────────────────
+    report.tasks.run_lighthouse_task = TaskStatus::InProgress;
+    broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
+
+    let artifact_path = PathBuf::from(&report.artifact_path);
+
+    if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
+        error!("Cannot create artifact dir {:?}: {e}", artifact_path);
+        report.tasks.run_lighthouse_task = TaskStatus::Failed;
+    } else {
+        match run_lighthouse(&route.url, &artifact_path, &config).await {
+            Ok(lh_report) => {
+                report.report = Some(lh_report);
+                report.tasks.run_lighthouse_task = TaskStatus::Completed;
+                info!(
+                    path  = %route.path,
+                    score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
+                    "Lighthouse complete"
+                );
+            }
+            Err(e) => {
+                warn!(url = %route.url, error = %e, "Lighthouse failed");
+                report.tasks.run_lighthouse_task = TaskStatus::Failed;
+            }
+        }
+    }
+
+    {
+        let mut reports = state.route_reports.write().await;
+        reports.insert(route.id.clone(), report.clone());
+    }
+    broadcast_and_update(&state, WsEvent::TaskComplete(report)).await;
+
+    // Release the concurrency slot explicitly so intent is clear at a glance.
+    drop(permit);
+}
+
+// ── Lighthouse subprocess ─────────────────────────────────────────────────────
+
+/// Invoke the Lighthouse Node.js worker and parse its JSON output.
+///
+/// The worker is expected to write `report.json` into `artifact_path`.
+async fn run_lighthouse(
+    url: &str,
+    artifact_path: &PathBuf,
+    config: &Config,
+) -> Result<LighthouseReport> {
+    if config.lighthouse_process_path.is_empty() {
+        return Err(anyhow::anyhow!("lighthouse_process_path is not configured"));
+    }
+
+    let device_str = match config.scanner.device {
+        crate::config::Device::Desktop => "desktop",
+        _ => "mobile",
+    };
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&config.lighthouse_process_path)
+        .arg("--url").arg(url)
+        .arg("--output-dir").arg(artifact_path)
+        .arg("--device").arg(device_str);
+    if config.scanner.throttle {
+        cmd.arg("--throttle");
+    }
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "lighthouse exited with {}: {stderr}",
+            output.status
+        ));
+    }
+
+    let json = tokio::fs::read_to_string(artifact_path.join("report.json")).await?;
+    parse_lighthouse_report(&serde_json::from_str(&json)?)
+}
+
+/// Extract scores and full audit data from the Lighthouse JSON output.
+fn parse_lighthouse_report(raw: &serde_json::Value) -> Result<LighthouseReport> {
+    let cats = raw
+        .get("categories")
+        .ok_or_else(|| anyhow::anyhow!("Missing 'categories' in lighthouse report"))?
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("'categories' is not an object"))?;
+
+    let mut categories = std::collections::HashMap::new();
+    let mut score_sum = 0.0f64;
+    let mut score_count = 0usize;
+
+    for (key, cat) in cats {
+        let score = cat.get("score").and_then(|s| s.as_f64());
+        let title = cat.get("title").and_then(|t| t.as_str()).map(str::to_string);
+
+        if let Some(s) = score {
+            score_sum += s;
+            score_count += 1;
+        }
+
+        categories.insert(
+            key.clone(),
+            LighthouseCategoryScore {
+                score,
+                title,
+                key: Some(key.clone()),
+            },
+        );
+    }
+
+    let aggregate = if score_count > 0 { score_sum / score_count as f64 } else { 0.0 };
+
+    // Pass the full audits object through so the client can render
+    // screenshot-thumbnails, LCP, CLS, colour-contrast, etc.
+    let audits = raw
+        .get("audits")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    Ok(LighthouseReport { score: aggregate, categories, audits })
+}
+
+// ── Worker loop ───────────────────────────────────────────────────────────────
+
+/// Drain the work channel indefinitely, spawning one `process_route` task per
+/// route received.
+///
+/// The [`BrowserHandle`] is shared across all spawned tasks; it is cheaply
+/// cloneable and internally reference-counted. Each task opens/closes its own
+/// browser tab (or makes its own HTTP request) rather than its own browser.
+///
+/// Deduplication is applied here: routes already registered in
+/// `AppState::route_reports` are skipped. Note that routes discovered during
+/// crawling are pre-registered under the write lock in `process_route`, so
+/// this check acts as a secondary guard against channel duplicates.
+///
+/// Returns when the work channel sender is dropped (i.e., at program shutdown).
+pub async fn run_worker_loop(
+    state: Arc<AppState>,
+    browser: BrowserHandle,
+    mut work_rx: tokio::sync::mpsc::Receiver<crate::types::NormalisedRoute>,
+) {
+    info!(concurrency = state.config.workers, "Worker loop started");
+
+    while let Some(route) = work_rx.recv().await {
+        // Skip if already registered (dedup)
+        if state.route_reports.read().await.contains_key(&route.id) {
+            debug!(path = %route.path, "Skipping already-queued route");
+            continue;
+        }
+
+        let state2 = state.clone();
+        let browser2 = browser.clone();
+        tokio::spawn(async move {
+            process_route(route, state2, browser2).await;
+        });
+    }
+}

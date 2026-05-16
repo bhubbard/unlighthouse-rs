@@ -3,10 +3,19 @@
   "type": "module",
   "version": "0.17.9",
   "private": true,
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@11.1.2+sha512.415a1cc25974731e75455c1468371be74c5aa5fb7621b50d4056d222451609f11412f23fd602e6169f1e060466641f798597e1be961a10688836a67b16569499",
   "license": "MIT",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@parcel/watcher",
+      "esbuild",
+      "puppeteer",
+      "vue-demi"
+    ]
+  },
   "scripts": {
     "cli": "JITI_ESM_RESOLVE=1 node packages/cli/dist/cli.mjs",
+    "dev:rs": "./dev-rs.sh",
     "ci": "JITI_ESM_RESOLVE=1 node packages/cli/dist/ci.mjs",
     "ci:docs": "node packages/cli/dist/ci.mjs --site unlighthouse.dev --build-static --debug",
     "build": "pnpm run build:pkg",
