@@ -1,16 +1,25 @@
 pub mod csv;
 pub mod json;
 pub mod markdown;
+
+#[cfg(feature = "native")]
 pub mod lhci;
 
+#[cfg(feature = "native")]
 use anyhow::Result;
+
+#[cfg(feature = "native")]
 use std::path::Path;
+#[cfg(feature = "native")]
 use tracing::info;
 
+#[cfg(feature = "native")]
 use crate::config::ReporterType;
+#[cfg(feature = "native")]
 use crate::types::RouteReport;
 
 /// Write the configured report to the output path and return the file path written or compare URL.
+#[cfg(feature = "native")]
 pub async fn write_report(
     reports: &[RouteReport],
     config: &crate::config::Config,

@@ -32,31 +32,6 @@ pub fn normalise_route(url: &str, site: &str) -> NormalisedRoute {
     }
 }
 
-/// Fetch and parse robots.txt, return disallow rules.
-async fn fetch_robots_rules(
-    client: &reqwest::Client,
-    site: &str,
-) -> Option<Vec<RobotsRule>> {
-    let robots_url = format!("{}/robots.txt", site.trim_end_matches('/'));
-    let resp = client
-        .get(&robots_url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().await.ok()?;
-    let parsed = parse_robots_txt(&body);
-    info!(
-        "Found /robots.txt — sitemaps: {}, groups: {}",
-        parsed.sitemaps.len(),
-        parsed.groups.len()
-    );
-    Some(collect_disallow_rules(&parsed))
-}
 
 /// Apply include/exclude filters to a path.
 pub fn passes_filters(path: &str, include: &[String], exclude: &[String]) -> bool {

@@ -41,6 +41,10 @@ pub struct AppState {
     pub work_tx: tokio::sync::mpsc::Sender<NormalisedRoute>,
     /// Shared HTTP client for proxying (CrUX)
     pub http_client: reqwest::Client,
+    /// SQLite connection pool — stores run history for score trending.
+    pub db: sqlx::SqlitePool,
+    /// Unique ID for the current scan run (hex string, md5-derived).
+    pub run_id: String,
 }
 
 impl AppState {
@@ -48,6 +52,8 @@ impl AppState {
         config: Arc<Config>,
         work_tx: tokio::sync::mpsc::Sender<NormalisedRoute>,
         lighthouse_pool: Option<Arc<crate::queue::pool::LighthousePool>>,
+        db: sqlx::SqlitePool,
+        run_id: String,
     ) -> Self {
         let (ws_tx, _) = broadcast::channel(1024);
         let workers = config.workers;
@@ -60,6 +66,8 @@ impl AppState {
             lighthouse_pool,
             work_tx,
             http_client: reqwest::Client::new(),
+            db,
+            run_id,
         }
     }
 }
@@ -319,6 +327,11 @@ pub async fn start_server(
         .route("/api/reports/rescan", post(api::rescan_all))
         .route("/api/reports/:id/rescan", post(api::rescan_one))
         .route("/api/crux/*site", get(api::get_crux_history))
+        // ── Historical score trending ────────────────────────────────────────
+        .route("/api/runs", get(api::list_runs))
+        .route("/api/runs/:run_id/scores", get(api::get_run_scores))
+        .route("/api/history/route", get(api::get_route_history))
+        // ────────────────────────────────────────────────────────────────────
         .route("/api/ws", get(ws_handler))
         .with_state(state.clone());
 

@@ -53,7 +53,7 @@ pub struct LighthouseReport {
     pub audits: serde_json::Value,
 }
 
-// ── SEO snapshot (from HTML inspection) ──────────────────────────────────────
+// ── SEO + HTTP health snapshot (from HTML inspection) ─────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -68,6 +68,52 @@ pub struct SeoData {
     pub external_links: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html_size: Option<usize>,
+    /// Final HTTP status code (200, 301, 404, 500, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    /// Populated when the server redirected the request to a different URL.
+    /// Contains the final destination URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_to: Option<String>,
+}
+
+impl SeoData {
+    /// True when the status code indicates a client or server error.
+    pub fn is_error(&self) -> bool {
+        self.status_code.map(|s| s >= 400).unwrap_or(false)
+    }
+
+    /// True when the server issued a redirect.
+    pub fn is_redirect(&self) -> bool {
+        self.redirect_to.is_some()
+    }
+}
+
+// ── Web Vitals snapshot (fast mode — no Lighthouse) ───────────────────────────
+
+/// Core Web Vitals measured natively via the browser's PerformanceObserver API.
+/// Populated only when `--mode fast` is active; `None` in full (Lighthouse) mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebVitalsSnapshot {
+    /// First Contentful Paint (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fcp: Option<f64>,
+    /// Largest Contentful Paint (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lcp: Option<f64>,
+    /// Cumulative Layout Shift (unitless)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cls: Option<f64>,
+    /// Time to First Byte (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttfb: Option<f64>,
+    /// Total Blocking Time (ms) — approximated via Long Tasks API
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tbt: Option<f64>,
+    /// Composite performance score (0.0–1.0), computed from the metrics above
+    /// using Core Web Vitals thresholds.
+    pub score: f64,
 }
 
 // ── Per-task status map ───────────────────────────────────────────────────────
@@ -93,6 +139,9 @@ pub struct RouteReport {
     pub report: Option<LighthouseReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seo: Option<SeoData>,
+    /// Populated in fast mode (--mode fast) instead of `report`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_vitals: Option<WebVitalsSnapshot>,
 }
 
 // ── Worker statistics ─────────────────────────────────────────────────────────

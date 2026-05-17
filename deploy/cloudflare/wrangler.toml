@@ -1,0 +1,18 @@
+name = "unlighthouse-edge-auditor"
+main = "worker.ts"
+compatibility_date = "2026-05-17"
+
+# Enable Cloudflare Browser Rendering (managed headless Chrome isolates)
+[browser]
+binding = "MY_BROWSER"
+
+# Cloudflare R2 bucket for saving screenshots and HTML/JSON audit reports
+[[r2_buckets]]
+binding = "AUDIT_BUCKET"
+bucket_name = "unlighthouse-audits"
+
+# Cloudflare D1 serverless SQLite database for route queues and scan states
+[[d1_databases]]
+binding = "DB"
+database_name = "unlighthouse-db"
+database_id = "YOUR_D1_DATABASE_UUID_HERE"

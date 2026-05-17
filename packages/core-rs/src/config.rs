@@ -32,6 +32,114 @@ impl std::str::FromStr for ReporterType {
     }
 }
 
+// ── Scan mode ─────────────────────────────────────────────────────────────────
+
+/// Controls how each page is audited.
+///
+/// `Full` (default) — runs the Lighthouse Node.js subprocess for complete
+/// performance, accessibility, best-practices and SEO scores.
+///
+/// `Fast` — skips Lighthouse entirely.  Instead, Core Web Vitals (FCP, LCP,
+/// CLS, TTFB, TBT) are measured natively via the browser's PerformanceObserver
+/// API through chromiumoxide or headless_chrome.  No Node.js process is
+/// spawned, making scans significantly faster.  Use `--browser chromiumoxide`
+/// or `--browser headless_chrome` together with `--mode fast`; the reqwest
+/// backend will still perform HTML inspection but cannot measure vitals.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanMode {
+    #[default]
+    Full,
+    Fast,
+}
+
+impl std::str::FromStr for ScanMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "full" => Ok(Self::Full),
+            "fast" => Ok(Self::Fast),
+            other => anyhow::bail!("Unknown mode: {other:?}. Expected: full | fast"),
+        }
+    }
+}
+
+// ── Score budget rules ────────────────────────────────────────────────────────
+
+/// A per-path score budget.  The first rule whose `path` glob matches a
+/// route's path is applied.  Scores are 0–100 (not 0–1).
+///
+/// Example in `unlighthouse.config.toml`:
+/// ```toml
+/// [[budgets]]
+/// path = "/checkout/**"
+/// performance = 90
+/// accessibility = 85
+///
+/// [[budgets]]
+/// path = "/**"
+/// performance = 70
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetRule {
+    /// Glob pattern matched against the route path (e.g. `/blog/**`).
+    pub path: String,
+    /// Minimum allowed composite score (0–100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub performance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accessibility: Option<f64>,
+    #[serde(rename = "bestPractices", skip_serializing_if = "Option::is_none")]
+    pub best_practices: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seo: Option<f64>,
+}
+
+impl BudgetRule {
+    /// Returns a list of `(label, threshold, actual)` for every category that
+    /// failed the budget check.  `actual` is already multiplied to 0–100.
+    pub fn violations(
+        &self,
+        categories: &std::collections::HashMap<String, crate::types::LighthouseCategoryScore>,
+        composite_score: f64,
+    ) -> Vec<BudgetViolation> {
+        let mut out = Vec::new();
+
+        let check = |label: &str, threshold: Option<f64>, key: &str| -> Option<BudgetViolation> {
+            let t = threshold?;
+            let actual = categories.get(key)?.score? * 100.0;
+            if actual < t {
+                Some(BudgetViolation { label: label.to_string(), threshold: t, actual })
+            } else {
+                None
+            }
+        };
+
+        if let Some(t) = self.score {
+            let actual = composite_score * 100.0;
+            if actual < t {
+                out.push(BudgetViolation { label: "score".to_string(), threshold: t, actual });
+            }
+        }
+        if let Some(v) = check("performance", self.performance, "performance") { out.push(v); }
+        if let Some(v) = check("accessibility", self.accessibility, "accessibility") { out.push(v); }
+        if let Some(v) = check("best-practices", self.best_practices, "best-practices") { out.push(v); }
+        if let Some(v) = check("seo", self.seo, "seo") { out.push(v); }
+
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BudgetViolation {
+    pub label: String,
+    pub threshold: f64,
+    pub actual: f64,
+}
+
 // ── Device enum ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -148,6 +256,10 @@ pub struct Config {
     pub user_agent: Option<String>,
     /// Google CrUX History API key. Required to fetch CrUX history data directly.
     pub crux_api_token: Option<String>,
+    /// Audit mode: `Full` (default) runs Lighthouse; `Fast` measures Web Vitals via CDP.
+    pub mode: ScanMode,
+    /// Per-path score budget rules evaluated in CI mode.
+    pub budgets: Vec<BudgetRule>,
 }
 
 impl Default for Config {
@@ -164,7 +276,10 @@ impl Default for Config {
             scanner: ScannerConfig::default(),
             lighthouse_process_path: String::new(),
             ci: CiConfig::default(),
+            #[cfg(feature = "native")]
             workers: (num_cpus::get() / 2).max(1),
+            #[cfg(not(feature = "native"))]
+            workers: 1,
             auth: None,
             cookies: None,
             local_storage: None,
@@ -172,6 +287,8 @@ impl Default for Config {
             extra_headers: None,
             user_agent: None,
             crux_api_token: None,
+            mode: ScanMode::Full,
+            budgets: Vec::new(),
         }
     }
 }
@@ -201,6 +318,8 @@ struct FileConfig {
     extra_headers: Option<std::collections::HashMap<String, String>>,
     user_agent: Option<String>,
     crux_api_token: Option<String>,
+    mode: Option<String>,
+    budgets: Option<Vec<BudgetRule>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -262,6 +381,7 @@ pub struct CliOverrides {
     pub lhci_build_token: Option<String>,
     pub lhci_auth: Option<String>,
     pub crux_api_token: Option<String>,
+    pub mode: Option<String>,
 }
 
 // ── Config loading logic ──────────────────────────────────────────────────────
@@ -338,6 +458,8 @@ fn apply_file_config(config: &mut Config, fc: FileConfig) -> Result<()> {
     merge_opt!(config.extra_headers, fc.extra_headers);
     merge_opt!(config.user_agent, fc.user_agent);
     merge_opt!(config.crux_api_token, fc.crux_api_token);
+    merge_parse!(config.mode, fc.mode, "Invalid mode value in config file");
+    if let Some(b) = fc.budgets { config.budgets = b; }
 
     if let Some(sc) = fc.scanner {
         merge_opt!(config.scanner.max_routes, sc.max_routes);
@@ -392,6 +514,7 @@ fn apply_cli_overrides(config: &mut Config, cli: CliOverrides) -> Result<()> {
     merge_opt!(config.ci.lhci_build_token, cli.lhci_build_token);
     merge_opt!(config.ci.lhci_auth, cli.lhci_auth);
     merge_opt!(config.crux_api_token, cli.crux_api_token);
+    merge_parse!(config.mode, cli.mode, "Invalid mode value in CLI");
 
     merge_parse!(config.scanner.device, cli.device, "Invalid device value in CLI");
     merge_parse!(config.ci.reporter, cli.reporter, "Invalid reporter value in CLI");
@@ -476,5 +599,195 @@ mod tests {
         assert_eq!(config.port, 9999);
         assert_eq!(config.scanner.max_routes, Some(10));
         assert_eq!(config.scanner.samples, 3);
+    }
+
+    #[test]
+    fn test_all_config_options_file_and_cli_merging() {
+        let mut config = Config::default();
+
+        // 1. Verify Default Config values
+        assert_eq!(config.site, "");
+        assert_eq!(config.port, 5678);
+        assert_eq!(config.scanner.device, Device::Mobile);
+        assert!(config.scanner.crawler);
+        assert_eq!(config.mode, ScanMode::Full);
+        assert!(config.budgets.is_empty());
+        assert_eq!(config.scanner.exclude.len(), 0);
+        assert_eq!(config.scanner.include.len(), 0);
+
+        // 2. Mock a complete FileConfig and apply it
+        let mut local_storage = std::collections::HashMap::new();
+        local_storage.insert("key".to_string(), serde_json::Value::String("val".to_string()));
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("Header".to_string(), "Value".to_string());
+
+        let budgets = vec![BudgetRule {
+            path: "/checkout/**".to_string(),
+            score: Some(90.0),
+            performance: Some(85.0),
+            accessibility: None,
+            best_practices: None,
+            seo: None,
+        }];
+
+        let file_cfg = FileConfig {
+            site: Some("https://file-site.com".to_string()),
+            output_path: Some(".unlighthouse-file".to_string()),
+            debug: Some(true),
+            cache: Some(false),
+            router_prefix: Some("/sub".to_string()),
+            api_prefix: Some("/api-sub/".to_string()),
+            port: Some(8888),
+            host: Some("127.0.0.1".to_string()),
+            lighthouse_process_path: Some("/bin/lighthouse".to_string()),
+            workers: Some(4),
+            auth: Some(AuthConfig {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }),
+            cookies: Some(vec![CookieConfig {
+                name: "session".to_string(),
+                value: "abc".to_string(),
+                domain: Some("domain.com".to_string()),
+                path: Some("/".to_string()),
+            }]),
+            local_storage: Some(local_storage),
+            session_storage: None,
+            extra_headers: Some(extra_headers),
+            user_agent: Some("agent-x".to_string()),
+            crux_api_token: Some("file-token".to_string()),
+            mode: Some("fast".to_string()),
+            budgets: Some(budgets),
+            scanner: Some(FileScannerConfig {
+                max_routes: Some(500),
+                crawler: Some(false),
+                sitemap: Some(false),
+                robots_txt: Some(false),
+                dynamic_sampling: Some(10),
+                samples: Some(2),
+                throttle: Some(true),
+                device: Some("desktop".to_string()),
+                skip_javascript: Some(true),
+                warmup: Some(true),
+                block_assets: Some(true),
+                exclude: Some(vec!["/admin/**".to_string()]),
+                include: Some(vec!["/blog/**".to_string()]),
+            }),
+            ci: Some(FileCiConfig {
+                budget: Some(80.0),
+                build_static: Some(true),
+                reporter: Some("markdown".to_string()),
+                enabled: Some(true),
+                lhci_host: Some("lhci.com".to_string()),
+                lhci_build_token: Some("lhci-token".to_string()),
+                lhci_auth: Some("lhci-auth".to_string()),
+            }),
+        };
+
+        apply_file_config(&mut config, file_cfg).unwrap();
+
+        // Verify FileConfig took effect perfectly
+        assert_eq!(config.site, "https://file-site.com");
+        assert_eq!(config.output_path, ".unlighthouse-file");
+        assert!(config.debug);
+        assert!(!config.cache);
+        assert_eq!(config.router_prefix, "/sub");
+        assert_eq!(config.api_prefix, "/api-sub/");
+        assert_eq!(config.port, 8888);
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.lighthouse_process_path, "/bin/lighthouse");
+        assert_eq!(config.workers, 4);
+        assert_eq!(config.auth.as_ref().unwrap().username, "user");
+        assert_eq!(config.cookies.as_ref().unwrap()[0].name, "session");
+        assert_eq!(config.local_storage.as_ref().unwrap().get("key").unwrap().as_str().unwrap(), "val");
+        assert_eq!(config.extra_headers.as_ref().unwrap().get("Header").unwrap(), "Value");
+        assert_eq!(config.user_agent.as_ref().unwrap(), "agent-x");
+        assert_eq!(config.crux_api_token.as_ref().unwrap(), "file-token");
+        assert_eq!(config.mode, ScanMode::Fast);
+        assert_eq!(config.budgets[0].path, "/checkout/**");
+        assert_eq!(config.scanner.max_routes, Some(500));
+        assert!(!config.scanner.crawler);
+        assert!(!config.scanner.sitemap);
+        assert!(!config.scanner.robots_txt);
+        assert_eq!(config.scanner.dynamic_sampling, Some(10));
+        assert_eq!(config.scanner.samples, 2);
+        assert!(config.scanner.throttle);
+        assert_eq!(config.scanner.device, Device::Desktop);
+        assert!(config.scanner.skip_javascript);
+        assert!(config.scanner.warmup);
+        assert!(config.scanner.block_assets);
+        assert_eq!(config.scanner.exclude[0], "/admin/**");
+        assert_eq!(config.scanner.include[0], "/blog/**");
+        assert_eq!(config.ci.budget, Some(80.0));
+        assert!(config.ci.build_static);
+        assert_eq!(config.ci.reporter, ReporterType::Markdown);
+        assert!(config.ci.enabled);
+        assert_eq!(config.ci.lhci_host.as_ref().unwrap(), "lhci.com");
+        assert_eq!(config.ci.lhci_build_token.as_ref().unwrap(), "lhci-token");
+        assert_eq!(config.ci.lhci_auth.as_ref().unwrap(), "lhci-auth");
+
+        // 3. Mock a complete CliOverrides and apply it
+        let cli_overrides = CliOverrides {
+            site: Some("https://cli-site.com".to_string()),
+            output_path: Some(".unlighthouse-cli".to_string()),
+            debug: Some(false),
+            no_cache: Some(false), // means cache will be true (original cache is false)
+            device: Some("mobile".to_string()),
+            samples: Some(5),
+            throttle: Some(false),
+            max_routes: Some(100),
+            reporter: Some("lhci".to_string()),
+            build_static: Some(false),
+            budget: Some(95.0),
+            workers: Some(8),
+            ci: Some(false),
+            port: Some(7777),
+            host: Some("0.0.0.0".to_string()),
+            lighthouse_process_path: Some("/bin/cli-lh".to_string()),
+            include: Some(vec!["/cli-include".to_string()]),
+            exclude: Some(vec!["/cli-exclude".to_string()]),
+            skip_javascript: Some(bool_to_option(false)),
+            warmup: Some(false),
+            block_assets: Some(false),
+            lhci_host: Some("cli-lhci.com".to_string()),
+            lhci_build_token: Some("cli-lhci-token".to_string()),
+            lhci_auth: Some("cli-lhci-auth".to_string()),
+            crux_api_token: Some("cli-token".to_string()),
+            mode: Some("full".to_string()),
+        };
+
+        apply_cli_overrides(&mut config, cli_overrides).unwrap();
+
+        // Verify CLI took priority perfectly
+        assert_eq!(config.site, "https://cli-site.com");
+        assert_eq!(config.output_path, ".unlighthouse-cli");
+        assert!(!config.debug);
+        assert!(config.cache); // no_cache = false means cache = true
+        assert_eq!(config.scanner.device, Device::Mobile);
+        assert_eq!(config.scanner.samples, 5);
+        assert!(!config.scanner.throttle);
+        assert_eq!(config.scanner.max_routes, Some(100));
+        assert_eq!(config.ci.reporter, ReporterType::Lhci);
+        assert!(!config.ci.build_static);
+        assert_eq!(config.ci.budget, Some(95.0));
+        assert_eq!(config.workers, 8);
+        assert!(!config.ci.enabled);
+        assert_eq!(config.port, 7777);
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.lighthouse_process_path, "/bin/cli-lh");
+        assert_eq!(config.scanner.include[0], "/cli-include");
+        assert_eq!(config.scanner.exclude[0], "/cli-exclude");
+        assert!(!config.scanner.skip_javascript);
+        assert!(!config.scanner.warmup);
+        assert!(!config.scanner.block_assets);
+        assert_eq!(config.ci.lhci_host.as_ref().unwrap(), "cli-lhci.com");
+        assert_eq!(config.ci.lhci_build_token.as_ref().unwrap(), "cli-lhci-token");
+        assert_eq!(config.ci.lhci_auth.as_ref().unwrap(), "cli-lhci-auth");
+        assert_eq!(config.crux_api_token.as_ref().unwrap(), "cli-token");
+        assert_eq!(config.mode, ScanMode::Full);
+    }
+
+    fn bool_to_option(b: bool) -> bool {
+        b
     }
 }

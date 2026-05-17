@@ -28,6 +28,28 @@ const MdiViewDashboard = 'i-mdi-view-dashboard'
 const MdiWeb = 'i-mdi-web'
 const MdiWorld = 'i-mdi-world'
 
+const envApiUrl = (import.meta.env.VITE_UNLIGHTHOUSE_API_URL as string) || ''
+const envWsUrl = envApiUrl ? `${envApiUrl.replace(/^http/, 'ws')}/ws` : ''
+
+const payload = window.__unlighthouse_payload || {
+  options: {
+    site: 'http://localhost',
+    client: {
+      columns: {},
+      groupRoutesKey: 'path',
+    },
+    websocketUrl: envWsUrl,
+    apiUrl: envApiUrl,
+    lighthouseOptions: {},
+    scanner: {
+      dynamicSampling: false,
+      throttle: false,
+      device: 'mobile',
+    },
+    routerPrefix: '',
+  },
+}
+
 const {
   options: {
     site,
@@ -45,7 +67,7 @@ const {
     },
     routerPrefix: basePath,
   },
-} = window.__unlighthouse_payload
+} = payload
 
 export const isStatic = window.__unlighthouse_static
 

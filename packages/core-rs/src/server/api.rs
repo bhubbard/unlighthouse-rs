@@ -1,10 +1,11 @@
 use axum::{
     body::Body,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use std::collections::HashMap as QueryMap;
 use std::sync::Arc;
 use tracing::info;
 
@@ -344,6 +345,69 @@ pub async fn get_crux_history(
         .body(Body::from(empty_json))
         .unwrap()
 }
+
+// ── Historical score trending ─────────────────────────────────────────────────
+
+/// GET /api/runs — list the most recent 50 scan runs for this site, newest first.
+///
+/// Each entry contains the run ID, timestamps, scan mode and route count so the
+/// client can display a run-picker or label the X-axis of a trend chart.
+pub async fn list_runs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match crate::db::list_runs(&state.db, &state.config.site, 50).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(e) => {
+            tracing::error!("DB error listing runs: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /api/runs/:run_id/scores — all per-route scores for one historical run.
+///
+/// Returns an array of `RouteScoreRecord` objects (one per route), sorted by
+/// path.  Scores are in the 0.0–1.0 range (multiply by 100 for display).
+pub async fn get_run_scores(
+    Path(run_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match crate::db::get_run_scores(&state.db, &run_id).await {
+        Ok(scores) => Json(scores).into_response(),
+        Err(e) => {
+            tracing::error!("DB error fetching run scores for {run_id}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// GET /api/history/route?path=/some/page — score trend for one route path.
+///
+/// Returns an array of `RouteTrendPoint` objects ordered oldest-to-newest,
+/// each containing the run ID, its `started_at` timestamp, and all numeric
+/// score/metric fields.  Only finished runs are included.
+///
+/// The dashboard can plot these directly as a time-series (the recharts shape
+/// already used for CrUX history is compatible).
+pub async fn get_route_history(
+    Query(params): Query<QueryMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let path = match params.get("path") {
+        Some(p) => p.clone(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "Missing ?path= query parameter").into_response();
+        }
+    };
+
+    match crate::db::get_route_trend(&state.db, &state.config.site, &path).await {
+        Ok(trend) => Json(trend).into_response(),
+        Err(e) => {
+            tracing::error!("DB error fetching trend for {path}: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /// Broadcast a WsEvent to all WS subscribers and update scan meta.
 pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {

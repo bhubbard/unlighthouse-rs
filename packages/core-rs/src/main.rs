@@ -1,26 +1,21 @@
 #![allow(dead_code)]
 
-mod config;
-mod discovery;
-mod queue;
-mod reporters;
-mod server;
-mod types;
-mod util;
+#[cfg(feature = "native")]
+mod native_cli {
+    use anyhow::{Context, Result};
+    use clap::Parser;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tracing::{error, info, warn};
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tracing::{error, info, warn};
-
-use config::{CliOverrides, Config, ReporterType};
-use discovery::routes::resolve_reportable_routes;
-use queue::browser::{launch_chromiumoxide, launch_headless_chrome, launch_reqwest};
-use queue::worker::run_worker_loop;
-use reporters::write_report;
-use server::{start_server, AppState};
-use types::TaskStatus;
+    use unlighthouse_rs::config::{CliOverrides, Config, ReporterType};
+    use unlighthouse_rs::db;
+    use unlighthouse_rs::discovery::routes::resolve_reportable_routes;
+    use unlighthouse_rs::queue::browser::{launch_chromiumoxide, launch_headless_chrome, launch_reqwest};
+    use unlighthouse_rs::queue::worker::run_worker_loop;
+    use unlighthouse_rs::reporters::write_report;
+    use unlighthouse_rs::server::{start_server, AppState};
+    use unlighthouse_rs::types::TaskStatus;
 
 // ── CLI argument definition ───────────────────────────────────────────────────
 
@@ -147,13 +142,19 @@ struct Cli {
     /// Required to fetch CrUX history data directly from the Google API.
     #[arg(long, env = "CRUX_API_TOKEN")]
     crux_api_token: Option<String>,
+
+    /// Audit mode: full (default) or fast.
+    /// full — runs the Lighthouse Node.js subprocess for complete scores.
+    /// fast — measures Core Web Vitals natively via the browser CDP API,
+    ///        no Node.js required. Best used with --browser chromiumoxide.
+    #[arg(long, default_value = "full", value_parser = ["full", "fast"])]
+    mode: String,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    pub async fn run() -> Result<()> {
+        let cli = Cli::parse();
 
     // Set up tracing
     let log_level = if cli.debug { "debug" } else { "info" };
@@ -191,9 +192,10 @@ async fn main() -> Result<()> {
         lhci_build_token: cli.lhci_build_token.clone(),
         lhci_auth: cli.lhci_auth.clone(),
         crux_api_token: cli.crux_api_token.clone(),
+        mode: Some(cli.mode.clone()),
     };
 
-    let config = config::load_config(cli.config_file.as_ref(), overrides)
+    let config = unlighthouse_rs::config::load_config(cli.config_file.as_ref(), overrides)
         .context("Failed to load configuration")?;
 
     if config.site.is_empty() {
@@ -259,12 +261,34 @@ async fn main() -> Result<()> {
     info!(backend = %cli.browser, "HTML inspection backend ready");
 
     // Work channel (routes to process)
-    let (work_tx, work_rx) = tokio::sync::mpsc::channel::<types::NormalisedRoute>(1024);
+    let (work_tx, work_rx) = tokio::sync::mpsc::channel::<unlighthouse_rs::types::NormalisedRoute>(1024);
+
+    // ── SQLite database (historical score trending) ───────────────────────────
+    let db_path = format!("{}/unlighthouse.db", config.output_path);
+    let sqlite = db::open(&db_path)
+        .await
+        .context("Failed to open SQLite database")?;
+
+    // Generate a unique ID for this scan run using the site URL + current
+    // timestamp, hashed with md5 (avoids adding a uuid dependency).
+    let run_id = format!(
+        "{:x}",
+        md5::compute(format!("{}{}", config.site, chrono::Utc::now().timestamp_millis()))
+    );
+
+    let mode_str = match config.mode {
+        unlighthouse_rs::config::ScanMode::Full => "full",
+        unlighthouse_rs::config::ScanMode::Fast => "fast",
+    };
+    db::insert_run(&sqlite, &run_id, &config.site, mode_str)
+        .await
+        .context("Failed to record scan run in DB")?;
+    info!(run_id = %run_id, db = %db_path, "Scan run registered in SQLite");
 
     // App state (shared with server + workers)
     // Initialize the persistent worker pool if configured
     let pool = if !config.lighthouse_process_path.is_empty() && config.workers > 0 {
-        match queue::pool::LighthousePool::new(&config, config.workers).await {
+        match unlighthouse_rs::queue::pool::LighthousePool::new(&config, config.workers).await {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 warn!("Failed to initialize persistent worker pool: {e}. Falling back to one-off processes.");
@@ -276,7 +300,13 @@ async fn main() -> Result<()> {
     };
 
     // App state (shared with server + workers)
-    let state = Arc::new(server::AppState::new(Arc::clone(&config), work_tx.clone(), pool));
+    let state = Arc::new(unlighthouse_rs::server::AppState::new(
+        Arc::clone(&config),
+        work_tx.clone(),
+        pool,
+        sqlite,
+        run_id,
+    ));
 
     // ── Route discovery (uses reqwest — no browser needed for sitemaps/robots) ─
     info!("Starting route discovery...");
@@ -305,7 +335,7 @@ async fn main() -> Result<()> {
     // ── Server mode: start HTTP server or MCP server + keep running ───────────
     if cli.mcp {
         info!("Starting MCP server...");
-        server::mcp::run_mcp_server(state.clone()).await?;
+        unlighthouse_rs::server::mcp::run_mcp_server(state.clone()).await?;
     } else {
         let listener = listener.ok_or_else(|| anyhow::anyhow!("TCP listener was not initialized"))?;
         let addr = listener.local_addr()?;
@@ -392,11 +422,16 @@ async fn run_ci_mode(
         }
     }
 
-    // Check budget
+    // ── Global budget check (--budget / ci.budget) ───────────────────────────
     if let Some(budget) = config.ci.budget {
         let scores: Vec<f64> = reports
             .iter()
-            .filter_map(|r| r.report.as_ref().map(|rep| rep.score * 100.0))
+            .filter_map(|r| {
+                // Full mode: use Lighthouse score.
+                // Fast mode: fall back to Web Vitals composite score.
+                r.report.as_ref().map(|rep| rep.score * 100.0)
+                    .or_else(|| r.web_vitals.as_ref().map(|wv| wv.score * 100.0))
+            })
             .collect();
 
         if scores.is_empty() {
@@ -413,5 +448,69 @@ async fn run_ci_mode(
         }
     }
 
-    Ok(())
+    // ── Per-route budget rules (config.budgets) ──────────────────────────────
+    if !config.budgets.is_empty() {
+        let mut any_violation = false;
+
+        for report in &reports {
+            // Find the first matching budget rule for this route's path.
+            let rule = config.budgets.iter().find(|r| {
+                glob::Pattern::new(&r.path)
+                    .map(|p| p.matches(&report.route.path))
+                    .unwrap_or(false)
+            });
+
+            let Some(rule) = rule else { continue };
+
+            if let Some(ref lh) = report.report {
+                // Full mode: check per-category thresholds.
+                let violations = rule.violations(&lh.categories, lh.score);
+                for v in &violations {
+                    error!(
+                        path      = %report.route.path,
+                        category  = %v.label,
+                        actual    = v.actual,
+                        threshold = v.threshold,
+                        "Per-route budget violation"
+                    );
+                    any_violation = true;
+                }
+            } else if let Some(ref wv) = report.web_vitals {
+                // Fast mode: only the composite score is available.
+                if let Some(t) = rule.score {
+                    let actual = wv.score * 100.0;
+                    if actual < t {
+                        error!(
+                            path      = %report.route.path,
+                            actual    = actual,
+                            threshold = t,
+                            "Per-route budget violation (fast mode — composite score)"
+                        );
+                        any_violation = true;
+                    }
+                }
+            }
+        }
+
+        if any_violation {
+            std::process::exit(1);
+        } else if !reports.is_empty() {
+            info!("All per-route budget checks passed.");
+        }
+    }
+
+        Ok(())
+    }
+} // end of mod native_cli
+
+#[cfg(feature = "native")]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    native_cli::run().await
+}
+
+#[cfg(not(feature = "native"))]
+fn main() {
+    eprintln!("Error: The unlighthouse-rs CLI binary requires the 'native' feature to be enabled.");
+    std::process::exit(1);
 }

@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::discovery::routes::normalise_route;
 use crate::server::api::broadcast_and_update;
 use crate::server::AppState;
+use crate::config::ScanMode;
 use crate::types::{
     LighthouseCategoryScore, LighthouseReport, RouteReport, TaskMap, TaskStatus, WsEvent,
 };
@@ -34,6 +35,7 @@ pub fn create_route_report(route: &crate::types::NormalisedRoute, config: &Confi
         },
         report: None,
         seo: None,
+        web_vitals: None,
     }
 }
 
@@ -123,83 +125,119 @@ pub async fn process_route(
         broadcast_and_update(&state, WsEvent::TaskComplete(report.clone())).await;
     }
 
-    // ── Step 2: Lighthouse audit (Controlled Concurrency via Pool) ────────────
+    // ── Step 2: Lighthouse audit OR fast Web Vitals measurement ─────────────
     {
         let _permit = state.lighthouse_semaphore.acquire().await.expect("semaphore closed");
-        
+
         report.tasks.run_lighthouse_task = TaskStatus::InProgress;
         broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
 
-        let artifact_path = PathBuf::from(&report.artifact_path);
-
-        if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
-            error!("Cannot create artifact dir {:?}: {e}", artifact_path);
-            report.tasks.run_lighthouse_task = TaskStatus::Failed;
-        } else {
-            // Use the pool if available, otherwise fallback to one-off
-            let res = if let Some(pool) = &state.lighthouse_pool {
-                // Determine a worker index (could be random or based on route id)
-                let worker_idx = route.id.chars().next().unwrap_or('0') as usize;
-                let worker = pool.get_worker(worker_idx).await;
-                let mut worker = worker.lock().await;
-                
-                let device_str = match config.scanner.device {
-                    crate::config::Device::Desktop => "desktop",
-                    _ => "mobile",
-                };
-                
-                worker.audit(crate::queue::pool::AuditTask {
-                    url: route.url.clone(),
-                    output_dir: report.artifact_path.clone(),
-                    device: device_str.to_string(),
-                    throttle: config.scanner.throttle,
-                    skip_javascript: config.scanner.skip_javascript,
-                    block_assets: config.scanner.block_assets,
-                    warmup: config.scanner.warmup,
-                    auth: config.auth.clone(),
-                    cookies: config.cookies.clone(),
-                    local_storage: config.local_storage.clone(),
-                    session_storage: config.session_storage.clone(),
-                    extra_headers: config.extra_headers.clone(),
-                    user_agent: config.user_agent.clone(),
-                }).await
-            } else {
-                // Fallback to one-off process (backward compatibility)
-                run_lighthouse_fallback(&route.url, &artifact_path, &config).await
-                    .map(|r| crate::queue::pool::AuditResult {
-                        success: true,
-                        url: route.url.clone(),
-                        scores: Some(r.categories.iter().map(|(k, v)| (k.clone(), v.score.unwrap_or(0.0))).collect()),
-                        error: None,
-                    })
-                    .map_err(|e| e)
-            };
-
-            match res {
-                Ok(audit_res) if audit_res.success => {
-                    // Re-parse the report.json to get full audits
-                    let json_path = artifact_path.join("report.json");
-                    if let Ok(json) = tokio::fs::read_to_string(json_path).await {
-                        if let Ok(lh_report) = parse_lighthouse_report(&serde_json::from_str(&json).unwrap()) {
-                             report.report = Some(lh_report);
-                        }
-                    }
-                    report.tasks.run_lighthouse_task = TaskStatus::Completed;
+        if config.mode == ScanMode::Fast {
+            // ── Fast mode: measure Core Web Vitals natively via CDP ──────────
+            match browser.measure_vitals(&route.url).await {
+                Ok(Some(vitals)) => {
                     info!(
                         path  = %route.path,
-                        score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
-                        "Lighthouse complete"
+                        score = vitals.score,
+                        lcp   = ?vitals.lcp,
+                        cls   = ?vitals.cls,
+                        "Web Vitals measured (fast mode)"
                     );
+                    report.web_vitals = Some(vitals);
+                    report.tasks.run_lighthouse_task = TaskStatus::Completed;
                 }
-                Ok(audit_res) => {
-                    warn!(url = %route.url, error = ?audit_res.error, "Lighthouse failed");
-                    report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                Ok(None) => {
+                    // reqwest backend — no JS engine; mark as ignored so CI mode
+                    // doesn't stall waiting for Lighthouse.
+                    debug!(path = %route.path, "Fast mode: reqwest backend has no JS engine; skipping vitals");
+                    report.tasks.run_lighthouse_task = TaskStatus::Ignore;
                 }
                 Err(e) => {
-                    warn!(url = %route.url, error = %e, "Lighthouse pool audit failed");
+                    warn!(url = %route.url, error = %e, "Web Vitals measurement failed");
                     report.tasks.run_lighthouse_task = TaskStatus::Failed;
                 }
             }
+        } else {
+            // ── Full mode: run Lighthouse Node.js subprocess ─────────────────
+            let artifact_path = PathBuf::from(&report.artifact_path);
+
+            if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
+                error!("Cannot create artifact dir {:?}: {e}", artifact_path);
+                report.tasks.run_lighthouse_task = TaskStatus::Failed;
+            } else {
+                // Use the pool if available, otherwise fallback to one-off
+                let res = if let Some(pool) = &state.lighthouse_pool {
+                    let worker_idx = route.id.chars().next().unwrap_or('0') as usize;
+                    let worker = pool.get_worker(worker_idx).await;
+                    let mut worker = worker.lock().await;
+
+                    let device_str = match config.scanner.device {
+                        crate::config::Device::Desktop => "desktop",
+                        _ => "mobile",
+                    };
+
+                    worker.audit(crate::queue::pool::AuditTask {
+                        url: route.url.clone(),
+                        output_dir: report.artifact_path.clone(),
+                        device: device_str.to_string(),
+                        throttle: config.scanner.throttle,
+                        skip_javascript: config.scanner.skip_javascript,
+                        block_assets: config.scanner.block_assets,
+                        warmup: config.scanner.warmup,
+                        auth: config.auth.clone(),
+                        cookies: config.cookies.clone(),
+                        local_storage: config.local_storage.clone(),
+                        session_storage: config.session_storage.clone(),
+                        extra_headers: config.extra_headers.clone(),
+                        user_agent: config.user_agent.clone(),
+                    }).await
+                } else {
+                    run_lighthouse_fallback(&route.url, &artifact_path, &config).await
+                        .map(|r| crate::queue::pool::AuditResult {
+                            success: true,
+                            url: route.url.clone(),
+                            scores: Some(r.categories.iter().map(|(k, v)| (k.clone(), v.score.unwrap_or(0.0))).collect()),
+                            error: None,
+                        })
+                };
+
+                match res {
+                    Ok(audit_res) if audit_res.success => {
+                        let json_path = artifact_path.join("report.json");
+                        if let Ok(json) = tokio::fs::read_to_string(json_path).await {
+                            if let Ok(lh_report) = parse_lighthouse_report(&serde_json::from_str(&json).unwrap()) {
+                                report.report = Some(lh_report);
+                            }
+                        }
+                        report.tasks.run_lighthouse_task = TaskStatus::Completed;
+                        info!(
+                            path  = %route.path,
+                            score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
+                            "Lighthouse complete"
+                        );
+                    }
+                    Ok(audit_res) => {
+                        warn!(url = %route.url, error = ?audit_res.error, "Lighthouse failed");
+                        report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                    }
+                    Err(e) => {
+                        warn!(url = %route.url, error = %e, "Lighthouse pool audit failed");
+                        report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Persist to SQLite (non-fatal — a DB error must not abort the scan) ───
+    if matches!(
+        report.tasks.run_lighthouse_task,
+        TaskStatus::Completed | TaskStatus::Failed
+    ) {
+        if let Err(e) =
+            crate::db::insert_route_score(&state.db, &state.run_id, &report).await
+        {
+            warn!(url = %route.url, error = %e, "Failed to persist route score to DB");
         }
     }
 
