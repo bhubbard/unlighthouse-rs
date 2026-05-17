@@ -146,8 +146,7 @@ pub struct Config {
     pub session_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub extra_headers: Option<std::collections::HashMap<String, String>>,
     pub user_agent: Option<String>,
-    /// Google CrUX History API key. When set the Rust binary calls the CrUX API
-    /// directly; when absent it falls back to proxying crux.unlighthouse.dev.
+    /// Google CrUX History API key. Required to fetch CrUX history data directly.
     pub crux_api_token: Option<String>,
 }
 

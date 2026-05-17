@@ -6,11 +6,11 @@
  * references in the client; it ships no runtime code.
  */
 
-export type UnlighthouseTaskStatus =
-  | 'completed'
-  | 'in-progress'
-  | 'waiting'
-  | 'failed'
+export type UnlighthouseTaskStatus
+  = | 'completed'
+    | 'in-progress'
+    | 'waiting'
+    | 'failed'
 
 export interface LighthouseAudit {
   id?: string
@@ -29,7 +29,7 @@ export interface LighthouseCategory {
   id: string
   title?: string
   score?: number | null
-  auditRefs?: Array<{ id: string; weight: number }>
+  auditRefs?: Array<{ id: string, weight: number }>
 }
 
 export interface LighthouseReport {

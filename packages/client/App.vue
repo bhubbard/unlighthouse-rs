@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import UDropdownMenu from '@nuxt/ui/components/DropdownMenu.vue'
 import { useTitle } from '@vueuse/core'
-import { $fetch } from 'ofetch'
-import { defineAsyncComponent, onMounted, onUnmounted, computed, ref, nextTick, unref } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onMounted, onUnmounted, ref, unref } from 'vue'
 import { EXCLUDED_CATEGORIES } from './constants'
 import {
   apiUrl,
@@ -19,6 +18,7 @@ import { useUnlighthouseStore } from './stores/unlighthouse'
 
 const store = useUnlighthouseStore()
 const LighthouseThreeD = defineAsyncComponent(() => import('./components/LighthouseThreeD.vue'))
+const payload = typeof window !== 'undefined' ? (window as any).__unlighthouse_payload : {}
 
 if (!isStatic) {
   let refreshInterval: NodeJS.Timeout | null = null
@@ -313,10 +313,101 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
         <!-- Footer ... -->
       </footer>
       <!-- Modals ... -->
-      <UModal v-model:open="store.isDebugModalOpen" title="Debug Information">
+      <UModal v-model:open="store.isDebugModalOpen" title="Debug Information" :ui="{ content: '!max-w-xl' }">
         <template #body>
-          <div class="p-5 bg-gray-100 dark:bg-gray-800">
-            <!-- Debug Info ... -->
+          <div class="p-6 text-sm flex flex-col gap-6">
+            <!-- App Details -->
+            <div class="flex items-center justify-between border-b border-gray-200 dark:border-gray-700 pb-3">
+              <div class="flex flex-col">
+                <span class="font-semibold text-lg text-teal-600 dark:text-teal-400">Unlighthouse-RS</span>
+                <span class="text-xs opacity-60">Version v{{ payload?.version || '0.1.0' }}</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="h-2 w-2 rounded-full" :class="store.isOffline ? 'bg-red-500 animate-pulse' : 'bg-green-500'" />
+                <span class="text-xs font-mono uppercase font-bold tracking-wider" :class="store.isOffline ? 'text-red-500' : 'text-green-500'">
+                  {{ store.isOffline ? 'Offline' : 'Connected' }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Grid Stats -->
+            <div class="grid grid-cols-2 gap-4">
+              <div class="p-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700/50">
+                <div class="text-xs opacity-50 uppercase tracking-wide">
+                  Target Website
+                </div>
+                <div class="font-medium mt-1 truncate" :title="website">
+                  {{ website }}
+                </div>
+              </div>
+              <div class="p-3 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700/50">
+                <div class="text-xs opacity-50 uppercase tracking-wide">
+                  Loaded Reports
+                </div>
+                <div class="font-medium mt-1 text-lg">
+                  {{ store.unlighthouseReports?.length || 0 }}
+                </div>
+              </div>
+            </div>
+
+            <!-- Connection Stats -->
+            <div class="flex flex-col gap-3">
+              <h3 class="font-semibold text-gray-800 dark:text-gray-200 border-b border-gray-100 dark:border-gray-800 pb-1">
+                Connection Details
+              </h3>
+              <div class="flex flex-col gap-2 font-mono text-xs">
+                <div class="flex justify-between items-center bg-gray-50 dark:bg-gray-900/40 p-2 rounded">
+                  <span class="opacity-60">API URL</span>
+                  <span class="select-all">{{ apiUrl }}</span>
+                </div>
+                <div class="flex justify-between items-center bg-gray-50 dark:bg-gray-900/40 p-2 rounded">
+                  <span class="opacity-60">WebSocket URL</span>
+                  <span class="select-all">{{ payload?.options?.websocketUrl || 'N/A' }}</span>
+                </div>
+                <div class="flex justify-between items-center bg-gray-50 dark:bg-gray-900/40 p-2 rounded">
+                  <span class="opacity-60">Static Build</span>
+                  <span>{{ isStatic ? 'Yes' : 'No' }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Worker Details (if active/dynamic) -->
+            <div v-if="store.scanMeta?.monitor" class="flex flex-col gap-3">
+              <h3 class="font-semibold text-gray-800 dark:text-gray-200 border-b border-gray-100 dark:border-gray-800 pb-1">
+                Scanner Monitor
+              </h3>
+              <div class="grid grid-cols-2 gap-2 text-xs">
+                <div class="flex justify-between p-2 bg-gray-50 dark:bg-gray-900/40 rounded">
+                  <span class="opacity-60">Status</span>
+                  <span class="font-semibold capitalize text-teal-600 dark:text-teal-400">{{ store.scanMeta.monitor.status }}</span>
+                </div>
+                <div class="flex justify-between p-2 bg-gray-50 dark:bg-gray-900/40 rounded">
+                  <span class="opacity-60">Concurrency</span>
+                  <span>{{ store.scanMeta.monitor.workers }} workers</span>
+                </div>
+                <div class="flex justify-between p-2 bg-gray-50 dark:bg-gray-900/40 rounded">
+                  <span class="opacity-60">Progress</span>
+                  <span>{{ store.scanMeta.monitor.doneTargets }} / {{ store.scanMeta.monitor.allTargets }} ({{ store.scanMeta.monitor.donePercStr }}%)</span>
+                </div>
+                <div class="flex justify-between p-2 bg-gray-50 dark:bg-gray-900/40 rounded">
+                  <span class="opacity-60">Pages / Second</span>
+                  <span>{{ store.scanMeta.monitor.pagesPerSecond }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Raw Payload Explorer -->
+            <div class="flex flex-col gap-2">
+              <details class="group border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+                <summary class="flex justify-between items-center p-3 bg-gray-50 dark:bg-gray-800/80 cursor-pointer select-none font-medium hover:bg-gray-100 dark:hover:bg-gray-700/50 transition-colors">
+                  <span>Raw Configuration Payload</span>
+                  <UIcon name="i-heroicons-chevron-down" class="h-4 w-4 transform group-open:rotate-180 transition-transform" />
+                </summary>
+                <div class="p-3 bg-white dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700">
+                  <pre class="text-[10px] leading-relaxed font-mono p-3 bg-gray-50 dark:bg-gray-950 rounded max-h-[250px] overflow-y-auto overflow-x-auto select-all">{{ JSON.stringify(payload, null, 2) }}</pre>
+                </div>
+              </details>
+            </div>
           </div>
         </template>
       </UModal>
@@ -345,4 +436,3 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
     </div>
   </UApp>
 </template>
-

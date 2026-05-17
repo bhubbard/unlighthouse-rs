@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+/* eslint-disable no-console */
 /**
  * Standalone Lighthouse worker for unlighthouse-rs.
  * Supports persistent mode for high-performance auditing.
@@ -7,12 +8,13 @@
 import { Buffer } from 'node:buffer'
 import fs from 'node:fs'
 import path from 'node:path'
-import { parseArgs } from 'node:util'
 import readline from 'node:readline'
+import { parseArgs } from 'node:util'
 
 /** Strip the data-URI prefix and return a Buffer. */
 export function dataUriToBuffer(dataUri) {
-  if (!dataUri) return null
+  if (!dataUri)
+    return null
   const base64 = dataUri.replace(/^data:[^;]+;base64,/, '')
   return Buffer.from(base64, 'base64')
 }
@@ -26,8 +28,9 @@ async function init() {
     lighthouse = lh.default ?? lh
     const cl = await import('chrome-launcher')
     chromeLauncher = cl.default ?? cl
-  } catch (e) {
-    console.error('JSON_ERROR:' + JSON.stringify({ error: 'Initialization failed: ' + e.message }))
+  }
+  catch (e) {
+    console.error(`JSON_ERROR:${JSON.stringify({ error: `Initialization failed: ${e.message}` })}`)
     process.exit(1)
   }
 }
@@ -54,7 +57,7 @@ async function injectChromeConfig(port, task) {
     if (auth?.username && auth?.password) {
       const authStr = `${auth.username}:${auth.password}`
       const base64Auth = Buffer.from(authStr).toString('base64')
-      headers['Authorization'] = `Basic ${base64Auth}`
+      headers.Authorization = `Basic ${base64Auth}`
     }
     if (Object.keys(headers).length > 0) {
       await Network.setExtraHTTPHeaders({ headers })
@@ -84,13 +87,16 @@ async function injectChromeConfig(port, task) {
       `
       await Page.addScriptToEvaluateOnNewDocument({ source })
     }
-  } catch (e) {
-    console.error('CDP injection failed: ' + e.message)
-  } finally {
+  }
+  catch (e) {
+    console.error(`CDP injection failed: ${e.message}`)
+  }
+  finally {
     if (client) {
       try {
         await client.close()
-      } catch (_) {}
+      }
+      catch {}
     }
   }
 }
@@ -140,13 +146,15 @@ async function audit(task) {
         await Page.navigate({ url })
         await Page.loadEventFired()
         await client.close()
-      } catch (e) {
+      }
+      catch {
         // non-fatal
       }
     }
 
     const result = await lighthouse(url, flags)
-    if (!result?.lhr) throw new Error('Lighthouse returned no result')
+    if (!result?.lhr)
+      throw new Error('Lighthouse returned no result')
 
     const lhr = result.lhr
     fs.writeFileSync(path.join(outputDir, 'report.json'), result.report[0])
@@ -156,16 +164,19 @@ async function audit(task) {
     const finalScreenshot = lhr.audits?.['final-screenshot']?.details?.data
     if (finalScreenshot) {
       const buf = dataUriToBuffer(finalScreenshot)
-      if (buf) fs.writeFileSync(path.join(outputDir, 'screenshot.jpeg'), buf)
+      if (buf)
+        fs.writeFileSync(path.join(outputDir, 'screenshot.jpeg'), buf)
     }
     const fullPageData = lhr.fullPageScreenshot?.screenshot?.data
     if (fullPageData) {
       const buf = dataUriToBuffer(fullPageData)
-      if (buf) fs.writeFileSync(path.join(outputDir, 'full-screenshot.jpeg'), buf)
+      if (buf)
+        fs.writeFileSync(path.join(outputDir, 'full-screenshot.jpeg'), buf)
     }
 
     return { success: true, url, scores: Object.fromEntries(Object.entries(lhr.categories).map(([k, v]) => [k, v.score])) }
-  } catch (err) {
+  }
+  catch (err) {
     return { success: false, url, error: err.message }
   }
 }
@@ -190,17 +201,21 @@ async function run() {
   if (values.persistent) {
     const rl = readline.createInterface({ input: process.stdin })
     for await (const line of rl) {
-      if (!line.trim()) continue
+      if (!line.trim())
+        continue
       try {
         const task = JSON.parse(line)
         const result = await audit(task)
-        console.log('JSON_RESULT:' + JSON.stringify(result))
-      } catch (e) {
-        console.log('JSON_RESULT:' + JSON.stringify({ success: false, error: 'Invalid task JSON: ' + e.message }))
+        console.log(`JSON_RESULT:${JSON.stringify(result)}`)
+      }
+      catch (e) {
+        console.log(`JSON_RESULT:${JSON.stringify({ success: false, error: `Invalid task JSON: ${e.message}` })}`)
       }
     }
-    if (chrome) await chrome.kill()
-  } else {
+    if (chrome)
+      await chrome.kill()
+  }
+  else {
     // One-off mode (backward compatibility)
     const result = await audit({
       url: values.url,
@@ -209,16 +224,18 @@ async function run() {
       throttle: values.throttle,
       skipJavascript: values['skip-javascript'],
       blockAssets: values['block-assets'],
-      warmup: values.warmup
+      warmup: values.warmup,
     })
     if (result.success) {
       const scores = Object.entries(result.scores).map(([k, v]) => `${k}: ${Math.round(v * 100)}`).join(', ')
       console.log(`✓ ${result.url} — ${scores}`)
-    } else {
+    }
+    else {
       console.error(`✗ ${result.url} — ${result.error}`)
       process.exit(1)
     }
-    if (chrome) await chrome.kill()
+    if (chrome)
+      await chrome.kill()
   }
 }
 

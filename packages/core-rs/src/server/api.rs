@@ -289,12 +289,8 @@ pub async fn rescan_one(
 
 /// GET /api/crux/*site — fetch CrUX history data.
 ///
-/// When `config.crux_api_token` is set the Google CrUX History API is called
-/// directly and the result is normalised in Rust, eliminating the dependency on
-/// the external `crux.unlighthouse.dev` proxy service.
-///
-/// When no token is configured the handler falls back to proxying
-/// `crux.unlighthouse.dev` for backward compatibility.
+/// Calls the Google CrUX History API directly and normalises the response.
+/// Requires a configured `crux_api_token`.
 pub async fn get_crux_history(
     Path(site): Path<String>,
     State(state): State<Arc<AppState>>,
@@ -338,38 +334,15 @@ pub async fn get_crux_history(
         };
     }
 
-    // ── Fallback path: proxy to crux.unlighthouse.dev ─────────────────────────
-    let encoded_site = urlencoding::encode(&site);
-    let url = format!("https://crux.unlighthouse.dev/api/{}/crux/history", encoded_site);
-    info!("Proxying CrUX request for: {} (encoded: {})", site, encoded_site);
-
-    match state.http_client.get(&url).send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                let body = resp.bytes().await.unwrap_or_default();
-                (status, body).into_response()
-            } else {
-                info!(
-                    "CrUX proxy returned {} for: {}. Returning empty data.",
-                    status, site
-                );
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(empty_json))
-                    .unwrap()
-            }
-        }
-        Err(e) => {
-            tracing::error!("CrUX proxy error: {}", e);
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(empty_json))
-                .unwrap()
-        }
-    }
+    tracing::debug!(
+        "Google CrUX API token is not configured; skipping CrUX fetch for: {}",
+        site
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(empty_json))
+        .unwrap()
 }
 
 /// Broadcast a WsEvent to all WS subscribers and update scan meta.

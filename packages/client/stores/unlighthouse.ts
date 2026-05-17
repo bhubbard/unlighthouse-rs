@@ -1,37 +1,37 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 import {
-  activeTab,
-  isDebugModalOpen,
-  lighthouseReportModalOpen,
-  contentModalOpen,
-  thumbnailsModalOpen,
-  iframeModalUrl,
   activeScreenshots,
-  wsReports,
-  lastScanMeta,
-  fetchedScanMeta,
-  isOffline,
-  shouldShowWaitingState,
+  activeTab,
   categoryScores,
-  resultColumns,
-  searchText,
-  sorting,
-  page,
-  perPage,
-  searchResults,
-  paginatedResults,
-  incrementSort,
   closeAllModals,
+  closeThumbnailsModal,
+  contentModalOpen,
+  fetchedScanMeta,
+  iframeModalUrl,
+  incrementSort,
+  isDebugModalOpen,
+  isModalOpen,
+  isOffline,
+  lastScanMeta,
+  lighthouseReportModalOpen,
   openLighthouseReportIframeModal,
   openThumbnailsModal,
-  closeThumbnailsModal,
-  isModalOpen,
-  unlighthouseReports,
-  scanMeta,
+  page,
+  paginatedResults,
+  perPage,
   resolveArtifactPath,
+  resultColumns,
+  scanMeta,
+  searchResults,
+  searchText,
+  shouldShowWaitingState,
+  sorting,
+  thumbnailsModalOpen,
+  unlighthouseReports,
+  wsReports,
 } from '../logic'
-import { apiUrl, website, isStatic } from '../logic/static'
+import { apiUrl, isStatic, website } from '../logic/static'
 
 export interface Sorting {
   key?: string
@@ -44,11 +44,13 @@ export const useUnlighthouseStore = defineStore('unlighthouse', () => {
   const cruxError = ref(false)
 
   async function fetchCrux() {
-    if (isStatic) return
+    if (isStatic)
+      return
 
     try {
       const response = await fetch(`${apiUrl}/crux/${encodeURIComponent(website)}/history`)
-      if (!response.ok) throw new Error('CrUX API error')
+      if (!response.ok)
+        throw new Error('CrUX API error')
       crux.value = await response.json()
       cruxError.value = false
     }
@@ -63,8 +65,9 @@ export const useUnlighthouseStore = defineStore('unlighthouse', () => {
   }
 
   function setWsReports(reports: any[]) {
-    reports.forEach(r => {
-      if (r?.route?.path) wsReports.set(r.route.path, r)
+    reports.forEach((r) => {
+      if (r?.route?.path)
+        wsReports.set(r.route.path, r)
     })
   }
 

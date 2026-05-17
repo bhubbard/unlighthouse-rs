@@ -2,7 +2,7 @@ catalogMode: prefer
 
 shellEmulator: true
 
-trustPolicy: disabled
+trustPolicy: no-downgrade
 
 trustPolicyExclude:
   - chokidar@4.0.3
@@ -10,7 +10,6 @@ trustPolicyExclude:
   - semver@6.3.1
 packages:
   - packages/*
-  - crux-api
   - '!docs'
 
 overrides:
@@ -27,9 +26,7 @@ overrides:
 catalog:
   '@antfu/eslint-config': ^8.3.0
   '@arethetypeswrong/cli': 0.18.2
-  '@types/lodash-es': ^4.17.12
   '@types/three': ^0.183.1
-  '@types/ws': ^8.18.1
   '@vitejs/plugin-vue': ^6.0.6
   '@vue/compiler-sfc': ^3.5.32
   bumpp: ^11.1.0
@@ -42,59 +39,31 @@ catalog:
   vitest: ^4.1.6
 
 catalogs:
-  crux-api:
-    nitropack: latest
   dependencies:
-    '@clack/prompts': ^1.2.0
     '@iconify-json/carbon': latest
     '@iconify-json/icomoon-free': latest
     '@iconify-json/la': latest
     '@iconify-json/logos': latest
     '@iconify-json/mdi': latest
     '@iconify-json/simple-line-icons': latest
-    '@lhci/utils': ^0.15.1
     '@nuxt/ui': ^4.6.1
-    '@puppeteer/browsers': ^2.13.0
     '@tailwindcss/vite': ^4.2.2
     '@vueuse/core': ^14.2.1
     '@vueuse/router': ^14.2.1
-    c12: ^3.3.4
-    cac: ^7.0.0
-    chrome-launcher: ^1.2.1
-    consola: ^3.4.2
     defu: ^6.1.7
     fuse.js: ^7.3.0
-    h3: ^1.15.11
-    hookable: ^6.1.0
-    launch-editor: ^2.13.2
-    lighthouse: ^13.1.0
     lightweight-charts: ^5.1.0
-    listhen: ^1.9.1
     lodash-es: ^4.18.1
-    ofetch: ^1.5.1
-    pathe: ^2.0.3
-    puppeteer-cluster: ^0.25.0
-    puppeteer-core: ^24.40.0
-    radix3: ^1.1.2
-    regexparam: ^3.0.0
-    sanitize-filename: ^1.6.4
-    sitemapper: ^4.1.4
-    slugify: ^1.6.9
-    std-env: ^4.0.0
     tailwindcss: ^4.2.2
     three: ^0.183.2
     tinyexec: ^1.1.2
-    tinyglobby: ^0.2.16
     ufo: ^1.6.3
-    ultrahtml: ^1.6.0
-    unctx: ^2.5.0
     unplugin-auto-import: ^21.0.0
     unplugin-icons: ^23.0.1
     unplugin-vue-components: ^32.0.0
     vite: ^8.0.13
     vite-plugin-pages: ^0.33.3
     vue: ^3.5.32
-    ws: ^8.20.0
 
 ignoredBuiltDependencies:
   - vue-demi

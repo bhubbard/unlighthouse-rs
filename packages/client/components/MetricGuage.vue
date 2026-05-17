@@ -143,4 +143,3 @@ const accessibilityLabel = computed(() => {
   animation-delay: 250ms;
 }
 </style>
-

@@ -3,13 +3,12 @@ import type { UnlighthouseColumn, UnlighthouseRouteReport } from '@unlighthouse/
 import { apiUrl, categories, device, isOffline } from '../../logic'
 import { useUnlighthouseStore } from '../../stores/unlighthouse'
 
-const store = useUnlighthouseStore()
 const props = defineProps<{
   report: UnlighthouseRouteReport
   column: UnlighthouseColumn
   value: any
 }>()
-
+const store = useUnlighthouseStore()
 function openEditorRequest() {
   if (props.report.route.definition?.component) {
     fetch(`${apiUrl}/__launch?file=${props.report.route.definition.component}`)

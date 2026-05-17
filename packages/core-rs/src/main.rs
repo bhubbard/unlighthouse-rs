@@ -144,8 +144,7 @@ struct Cli {
     lhci_auth: Option<String>,
 
     /// Google CrUX History API key (env: CRUX_API_TOKEN).
-    /// When set, CrUX data is fetched directly from the Google API rather
-    /// than being proxied through crux.unlighthouse.dev.
+    /// Required to fetch CrUX history data directly from the Google API.
     #[arg(long, env = "CRUX_API_TOKEN")]
     crux_api_token: Option<String>,
 }

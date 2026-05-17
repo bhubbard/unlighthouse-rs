@@ -167,7 +167,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&curl_output.stdout);
         let stderr = String::from_utf8_lossy(&curl_output.stderr);
         
-        assert!(stdout.contains("\"dates\"") || stderr.contains("200 OK"), "CrUX proxy failed. stdout: {}, stderr: {}", stdout, stderr);
+        assert!(stdout.contains("\"dates\"") || stdout.contains("\"exists\"") || stderr.contains("200 OK"), "CrUX proxy failed. stdout: {}, stderr: {}", stdout, stderr);
     }
 }
 
