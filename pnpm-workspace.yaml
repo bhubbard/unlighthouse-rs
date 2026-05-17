@@ -28,7 +28,7 @@ catalog:
   '@arethetypeswrong/cli': 0.18.2
   '@types/three': ^0.183.1
   '@vitejs/plugin-vue': ^6.0.6
-  '@vue/compiler-sfc': ^3.5.32
+  '@vue/compiler-sfc': ^3.5.34
   bumpp: ^11.1.0
   chrome-remote-interface: ^0.34.0
   eslint: ^10.4.0
@@ -63,7 +63,7 @@ catalogs:
     unplugin-vue-components: ^32.0.0
     vite: ^8.0.13
     vite-plugin-pages: ^0.33.3
-    vue: ^3.5.32
+    vue: ^3.5.34
 
 ignoredBuiltDependencies:
   - vue-demi

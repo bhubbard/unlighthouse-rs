@@ -3,7 +3,7 @@
 //!
 //! # Schema
 //!
-//! ```
+//! ```text
 //! runs           — one row per scan invocation (site, started_at, finished_at)
 //! route_scores   — one row per (run × route); holds all numeric scores/metrics
 //! ```

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// @ts-check
 /* eslint-disable no-console */
 /**
  * Standalone Lighthouse worker for unlighthouse-rs.

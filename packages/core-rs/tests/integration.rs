@@ -149,8 +149,8 @@ mod tests {
             .spawn()
             .expect("failed to spawn server process");
 
-        // Wait for the server to boot up (instantly fast since it doesn't need to compile under cargo run!)
-        thread::sleep(Duration::from_secs(3));
+        // Wait for the server to boot up and complete route discovery
+        thread::sleep(Duration::from_secs(12));
 
         // Request the crux history proxy endpoint using curl
         let curl_output = Command::new("curl")

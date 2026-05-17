@@ -115,7 +115,10 @@ chrono = { version = "0.4", features = [ "serde" ], optional = true }
 # SQLite persistence — historical score trending across scan runs.
 # runtime-tokio-rustls = tokio async runtime + rustls (TLS unused for SQLite
 # but sqlx requires a runtime+tls feature pair to be selected).
-sqlx = { version = "0.7", features = [ "sqlite", "runtime-tokio-rustls" ], optional = true }
+sqlx = { version = "0.7", features = [
+  "sqlite",
+  "runtime-tokio-rustls"
+], optional = true }
 
 # Futures utilities (needed for chromiumoxide handler StreamExt)
 futures = "0.3"
