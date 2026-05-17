@@ -201,6 +201,72 @@ pub async fn get_reports(State(state): State<Arc<AppState>>) -> impl IntoRespons
     Json(completed)
 }
 
+fn build_monitor_stats(
+    state: &Arc<AppState>,
+    reports: &std::collections::HashMap<String, crate::types::RouteReport>,
+) -> Option<crate::types::WorkerStats> {
+    let total = reports.len();
+    if total == 0 {
+        return None;
+    }
+    
+    let done = reports
+        .values()
+        .filter(|r| r.tasks.run_lighthouse_task == TaskStatus::Completed)
+        .count();
+
+    let all_done = done == total;
+    
+    let elapsed = state.start_time.elapsed().as_secs();
+    let pps = if elapsed > 0 {
+        done as f64 / elapsed as f64
+    } else {
+        0.0
+    };
+    let pages_per_second = format!("{:.2}", pps);
+
+    let time_remaining = if all_done {
+        0
+    } else if done > 0 && pps > 0.0 {
+        let remaining_targets = total - done;
+        (remaining_targets as f64 / pps).round() as i64
+    } else {
+        -1
+    };
+
+    let active = if let Some(ref pool) = state.lighthouse_pool {
+        pool.active_workers()
+    } else {
+        0
+    };
+    let cpu_pct = if state.config.workers > 0 {
+        (active as f64 * 100.0 / state.config.workers as f64).round() as usize
+    } else {
+        0
+    };
+    let cpu_usage = Some(format!("{}% ({} / {} cores)", cpu_pct, active, state.config.workers));
+
+    Some(crate::types::WorkerStats {
+        status: if all_done {
+            WorkerStatus::Completed
+        } else {
+            WorkerStatus::Working
+        },
+        done_targets: done,
+        all_targets: total,
+        done_perc_str: format!(
+            "{:.0}",
+            done as f64 * 100.0 / total as f64
+        ),
+        error_perc: "0.00".to_string(),
+        time_running: elapsed,
+        time_remaining,
+        pages_per_second,
+        workers: state.config.workers,
+        cpu_usage,
+    })
+}
+
 /// GET /api/scan-meta — return current scan statistics
 pub async fn get_scan_meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let reports = state.route_reports.read().await;
@@ -215,35 +281,8 @@ pub async fn get_scan_meta(State(state): State<Arc<AppState>>) -> impl IntoRespo
         scores.iter().sum::<f64>() / scores.len() as f64
     };
 
-    // Build stats snapshot
-    let done = reports
-        .values()
-        .filter(|r| r.tasks.run_lighthouse_task == TaskStatus::Completed)
-        .count();
-
-    let all_done = done == total && total > 0;
-    let monitor = if total > 0 {
-        Some(crate::types::WorkerStats {
-            status: if all_done {
-                WorkerStatus::Completed
-            } else {
-                WorkerStatus::Working
-            },
-            done_targets: done,
-            all_targets: total,
-            done_perc_str: format!(
-                "{:.0}",
-                if total > 0 { done as f64 * 100.0 / total as f64 } else { 0.0 }
-            ),
-            error_perc: "0.00".to_string(),
-            time_running: 0,
-            time_remaining: -1,
-            pages_per_second: "0.00".to_string(),
-            workers: state.config.workers,
-        })
-    } else {
-        None
-    };
+    let monitor = build_monitor_stats(&state, &reports);
+    drop(reports);
 
     Json(ScanMeta {
         routes: total,
@@ -420,6 +459,7 @@ pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {
         .values()
         .filter_map(|r| r.report.as_ref().map(|rep| rep.score))
         .collect();
+    let monitor = build_monitor_stats(state, &reports);
     drop(reports);
 
     let avg_score = if scores.is_empty() {
@@ -431,7 +471,7 @@ pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {
     let meta_event = WsEvent::ScanMetaUpdate(ScanMeta {
         routes: total,
         score: avg_score,
-        monitor: None,
+        monitor,
     });
     super::websocket::broadcast(&state.ws_tx, &meta_event);
 }

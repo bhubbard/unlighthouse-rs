@@ -88,7 +88,25 @@ impl LighthousePool {
         Ok(Self { workers })
     }
 
-    pub async fn get_worker(&self, index: usize) -> Arc<Mutex<PersistentWorker>> {
-        Arc::clone(&self.workers[index % self.workers.len()])
+    pub async fn acquire_worker(&self) -> Arc<Mutex<PersistentWorker>> {
+        loop {
+            for worker in &self.workers {
+                if let Ok(guard) = worker.try_lock() {
+                    drop(guard);
+                    return Arc::clone(worker);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub fn active_workers(&self) -> usize {
+        let mut count = 0;
+        for worker in &self.workers {
+            if worker.try_lock().is_err() {
+                count += 1;
+            }
+        }
+        count
     }
 }

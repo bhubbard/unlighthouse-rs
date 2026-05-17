@@ -167,8 +167,7 @@ pub async fn process_route(
             } else {
                 // Use the pool if available, otherwise fallback to one-off
                 let res = if let Some(pool) = &state.lighthouse_pool {
-                    let worker_idx = route.id.chars().next().unwrap_or('0') as usize;
-                    let worker = pool.get_worker(worker_idx).await;
+                    let worker = pool.acquire_worker().await;
                     let mut worker = worker.lock().await;
 
                     let device_str = match config.scanner.device {
@@ -205,8 +204,10 @@ pub async fn process_route(
                     Ok(audit_res) if audit_res.success => {
                         let json_path = artifact_path.join("report.json");
                         if let Ok(json) = tokio::fs::read_to_string(json_path).await {
-                            if let Ok(lh_report) = parse_lighthouse_report(&serde_json::from_str(&json).unwrap()) {
-                                report.report = Some(lh_report);
+                            if let Ok(serde_val) = serde_json::from_str::<serde_json::Value>(&json) {
+                                if let Ok(lh_report) = parse_lighthouse_report(&serde_val) {
+                                    report.report = Some(lh_report);
+                                }
                             }
                         }
                         report.tasks.run_lighthouse_task = TaskStatus::Completed;

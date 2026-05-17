@@ -31,11 +31,30 @@ async fn inspect_reqwest(
     let final_url = response.url().to_string();
     let redirect_to = if final_url != url { Some(final_url) } else { None };
 
-    let base_url = response.url().clone();
+    let mut base_url = response.url().clone();
     let html = response.text().await?;
     let html_size = html.len();
 
     let document = scraper::Html::parse_document(&html);
+
+    // Extract base URL if `<base href="...">` is present.
+    let base_sel = scraper::Selector::parse("base[href]").expect("hardcoded CSS selector is valid");
+    if let Some(base_el) = document.select(&base_sel).next() {
+        if let Some(href) = base_el.value().attr("href") {
+            if let Ok(new_base) = base_url.join(href) {
+                base_url = new_base;
+            }
+        }
+    }
+
+    // Extract canonical URL if `<link rel="canonical" href="...">` is present.
+    let canonical_sel = scraper::Selector::parse("link[rel='canonical']").expect("hardcoded CSS selector is valid");
+    let canonical_url = document
+        .select(&canonical_sel)
+        .next()
+        .and_then(|el| el.value().attr("href"))
+        .and_then(|href| base_url.join(href).ok())
+        .map(|u| u.to_string());
 
     let title_sel = scraper::Selector::parse("title").expect("hardcoded CSS selector is valid");
     let title = document
@@ -94,6 +113,7 @@ async fn inspect_reqwest(
             html_size:      Some(html_size),
             status_code:    Some(status_code),
             redirect_to,
+            canonical_url,
         },
         internal_hrefs,
     ))
@@ -171,6 +191,7 @@ fn parse_cdp_result(json_str: &str, url: &str) -> Result<(SeoData, Vec<String>)>
             html_size:      Some(r.html_size),
             status_code:    r.status_code,
             redirect_to,
+            canonical_url:  None,
         },
         r.hrefs,
     ))

@@ -22,9 +22,6 @@ use crate::types::RouteReport;
 // ── DDL ───────────────────────────────────────────────────────────────────────
 
 const SCHEMA: &str = r#"
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS runs (
     id          TEXT    PRIMARY KEY,
     site        TEXT    NOT NULL,
@@ -55,6 +52,8 @@ CREATE TABLE IF NOT EXISTS route_scores (
 
 CREATE INDEX IF NOT EXISTS idx_rs_run_id ON route_scores(run_id);
 CREATE INDEX IF NOT EXISTS idx_rs_path   ON route_scores(path);
+CREATE INDEX IF NOT EXISTS idx_runs_site ON runs(site);
+CREATE INDEX IF NOT EXISTS idx_rs_run_path ON route_scores(run_id, path);
 "#;
 
 // ── Public row types (returned by query helpers and serialised to JSON) ───────
@@ -113,7 +112,7 @@ pub struct RouteTrendPoint {
 
 /// Open (or create) the SQLite database at `db_path` and apply the schema.
 ///
-/// Uses WAL mode for better write concurrency with the async reader tasks.
+/// Uses WAL mode and foreign keys configured natively in the connection pool.
 pub async fn open(db_path: &str) -> Result<SqlitePool> {
     // Ensure parent directory exists.
     if let Some(parent) = std::path::Path::new(db_path).parent() {
@@ -123,7 +122,7 @@ pub async fn open(db_path: &str) -> Result<SqlitePool> {
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         // `mode=rwc` — create the file if it does not yet exist.
-        .connect(&format!("sqlite://{}?mode=rwc", db_path))
+        .connect(&format!("sqlite://{}?mode=rwc&_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", db_path))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open SQLite DB at {db_path}: {e}"))?;
 
@@ -131,6 +130,17 @@ pub async fn open(db_path: &str) -> Result<SqlitePool> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
 
     Ok(pool)
+}
+
+/// Purge scan runs older than N days from the database.
+/// SQLite foreign key cascades will automatically delete associated route scores.
+pub async fn purge_old_runs(db: &SqlitePool, days: i64) -> Result<u64> {
+    let threshold = chrono::Utc::now().timestamp_millis() - (days * 24 * 60 * 60 * 1000);
+    let res = sqlx::query("DELETE FROM runs WHERE started_at < ?")
+        .bind(threshold)
+        .execute(db)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 // ── Run lifecycle ─────────────────────────────────────────────────────────────

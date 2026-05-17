@@ -260,6 +260,8 @@ pub struct Config {
     pub mode: ScanMode,
     /// Per-path score budget rules evaluated in CI mode.
     pub budgets: Vec<BudgetRule>,
+    /// Purge database runs older than this number of days (default: 30)
+    pub purge_runs_older_than_days: Option<i64>,
 }
 
 impl Default for Config {
@@ -289,6 +291,7 @@ impl Default for Config {
             crux_api_token: None,
             mode: ScanMode::Full,
             budgets: Vec::new(),
+            purge_runs_older_than_days: Some(30),
         }
     }
 }
@@ -320,6 +323,7 @@ struct FileConfig {
     crux_api_token: Option<String>,
     mode: Option<String>,
     budgets: Option<Vec<BudgetRule>>,
+    purge_runs_older_than_days: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -382,6 +386,7 @@ pub struct CliOverrides {
     pub lhci_auth: Option<String>,
     pub crux_api_token: Option<String>,
     pub mode: Option<String>,
+    pub purge_runs_older_than_days: Option<i64>,
 }
 
 // ── Config loading logic ──────────────────────────────────────────────────────
@@ -460,6 +465,7 @@ fn apply_file_config(config: &mut Config, fc: FileConfig) -> Result<()> {
     merge_opt!(config.crux_api_token, fc.crux_api_token);
     merge_parse!(config.mode, fc.mode, "Invalid mode value in config file");
     if let Some(b) = fc.budgets { config.budgets = b; }
+    merge_opt!(config.purge_runs_older_than_days, fc.purge_runs_older_than_days);
 
     if let Some(sc) = fc.scanner {
         merge_opt!(config.scanner.max_routes, sc.max_routes);
@@ -515,6 +521,7 @@ fn apply_cli_overrides(config: &mut Config, cli: CliOverrides) -> Result<()> {
     merge_opt!(config.ci.lhci_auth, cli.lhci_auth);
     merge_opt!(config.crux_api_token, cli.crux_api_token);
     merge_parse!(config.mode, cli.mode, "Invalid mode value in CLI");
+    merge_opt!(config.purge_runs_older_than_days, cli.purge_runs_older_than_days);
 
     merge_parse!(config.scanner.device, cli.device, "Invalid device value in CLI");
     merge_parse!(config.ci.reporter, cli.reporter, "Invalid reporter value in CLI");
@@ -658,6 +665,7 @@ mod tests {
             crux_api_token: Some("file-token".to_string()),
             mode: Some("fast".to_string()),
             budgets: Some(budgets),
+            purge_runs_older_than_days: Some(15),
             scanner: Some(FileScannerConfig {
                 max_routes: Some(500),
                 crawler: Some(false),
@@ -704,6 +712,7 @@ mod tests {
         assert_eq!(config.user_agent.as_ref().unwrap(), "agent-x");
         assert_eq!(config.crux_api_token.as_ref().unwrap(), "file-token");
         assert_eq!(config.mode, ScanMode::Fast);
+        assert_eq!(config.purge_runs_older_than_days, Some(15));
         assert_eq!(config.budgets[0].path, "/checkout/**");
         assert_eq!(config.scanner.max_routes, Some(500));
         assert!(!config.scanner.crawler);
@@ -754,6 +763,7 @@ mod tests {
             lhci_auth: Some("cli-lhci-auth".to_string()),
             crux_api_token: Some("cli-token".to_string()),
             mode: Some("full".to_string()),
+            purge_runs_older_than_days: Some(60),
         };
 
         apply_cli_overrides(&mut config, cli_overrides).unwrap();
@@ -785,6 +795,7 @@ mod tests {
         assert_eq!(config.ci.lhci_auth.as_ref().unwrap(), "cli-lhci-auth");
         assert_eq!(config.crux_api_token.as_ref().unwrap(), "cli-token");
         assert_eq!(config.mode, ScanMode::Full);
+        assert_eq!(config.purge_runs_older_than_days, Some(60));
     }
 
     fn bool_to_option(b: bool) -> bool {

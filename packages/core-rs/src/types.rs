@@ -75,6 +75,9 @@ pub struct SeoData {
     /// Contains the final destination URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_to: Option<String>,
+    /// Populated when the page defines a canonical URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
 }
 
 impl SeoData {
@@ -165,6 +168,8 @@ pub struct WorkerStats {
     pub time_remaining: i64,
     pub pages_per_second: String,
     pub workers: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_usage: Option<String>,
 }
 
 // ── Scan meta (sent to dashboard) ─────────────────────────────────────────────

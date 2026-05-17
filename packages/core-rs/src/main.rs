@@ -6,7 +6,7 @@ mod native_cli {
     use clap::Parser;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tracing::{error, info, warn};
+    use tracing::{debug, error, info, warn};
 
     use unlighthouse_rs::config::{CliOverrides, Config, ReporterType};
     use unlighthouse_rs::db;
@@ -149,6 +149,10 @@ struct Cli {
     ///        no Node.js required. Best used with --browser chromiumoxide.
     #[arg(long, default_value = "full", value_parser = ["full", "fast"])]
     mode: String,
+
+    /// Purge database runs older than this number of days
+    #[arg(long, default_value = "30")]
+    purge_runs_older_than_days: Option<i64>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -193,6 +197,7 @@ struct Cli {
         lhci_auth: cli.lhci_auth.clone(),
         crux_api_token: cli.crux_api_token.clone(),
         mode: Some(cli.mode.clone()),
+        purge_runs_older_than_days: cli.purge_runs_older_than_days,
     };
 
     let config = unlighthouse_rs::config::load_config(cli.config_file.as_ref(), overrides)
@@ -268,6 +273,14 @@ struct Cli {
     let sqlite = db::open(&db_path)
         .await
         .context("Failed to open SQLite database")?;
+
+    if let Some(days) = config.purge_runs_older_than_days {
+        match db::purge_old_runs(&sqlite, days).await {
+            Ok(count) if count > 0 => info!("SQLite cleanup complete: purged {count} old scan runs older than {days} days"),
+            Ok(_) => debug!("SQLite cleanup: no old runs to purge"),
+            Err(e) => warn!("SQLite cleanup warning: failed to purge old runs: {e}"),
+        }
+    }
 
     // Generate a unique ID for this scan run using the site URL + current
     // timestamp, hashed with md5 (avoids adding a uuid dependency).

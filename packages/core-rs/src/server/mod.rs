@@ -45,6 +45,8 @@ pub struct AppState {
     pub db: sqlx::SqlitePool,
     /// Unique ID for the current scan run (hex string, md5-derived).
     pub run_id: String,
+    /// Monotonic start time of the scan.
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
@@ -68,6 +70,7 @@ impl AppState {
             http_client: reqwest::Client::new(),
             db,
             run_id,
+            start_time: std::time::Instant::now(),
         }
     }
 }
