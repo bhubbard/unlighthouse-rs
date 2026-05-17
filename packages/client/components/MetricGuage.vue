@@ -48,18 +48,37 @@ const guageArcStyle = computed(() => {
     strokeDasharray: `${Math.max(offset, 0)}, ${CIRCUMFERENCE}`,
   }
 })
+
+const accessibilityLabel = computed(() => {
+  return `${props.label || 'Score'}: ${props.score === null ? 'Unknown' : Math.round(props.score * 100)}`
+})
 </script>
 
 <template>
-  <div v-if="props.stripped" :class="guageModifiers">
+  <div
+    v-if="props.stripped"
+    :class="guageModifiers"
+    role="progressbar"
+    :aria-valuenow="props.score !== null ? Math.round(props.score * 100) : undefined"
+    aria-valuemin="0"
+    aria-valuemax="100"
+    :aria-label="accessibilityLabel"
+  >
     <audit-result :value="{ score: props.score, displayValue: Math.round(props.score * 100) }" />
   </div>
 
-  <div v-else class="guage__wrapper guage__wrapper--huge" :class="[guageModifiers, gaugeColorClasses]">
-    <div
-      class="guage__svg-wrapper relative"
-    >
-      <svg class="guage" viewBox="0 0 120 120">
+  <div
+    v-else
+    class="guage__wrapper guage__wrapper--huge group transition-transform duration-300 hover:scale-110"
+    :class="[guageModifiers, gaugeColorClasses]"
+    role="progressbar"
+    :aria-valuenow="props.score !== null ? Math.round(props.score * 100) : undefined"
+    aria-valuemin="0"
+    aria-valuemax="100"
+    :aria-label="accessibilityLabel"
+  >
+    <div class="guage__svg-wrapper relative">
+      <svg class="guage" viewBox="0 0 120 120" role="img" :aria-label="accessibilityLabel">
         <circle
           class="guage-base"
           r="56"
@@ -80,61 +99,18 @@ const guageArcStyle = computed(() => {
       </svg>
       <div
         class="font-5xl font-bold left-[50%] top-[50%] transform -translate-y-[50%] -translate-x-[50%] absolute text-mono font-mono"
+        aria-hidden="true"
       >
         {{ props.score === null ? '?' : Math.round(props.score * 100) }}
       </div>
     </div>
-    <div class="text-xs mt-2">
+    <div class="text-xs mt-2 font-medium opacity-80 group-hover:opacity-100 transition-opacity" aria-hidden="true">
       {{ props.label }}
     </div>
   </div>
 </template>
 
-<style>
-* {
-  --color-amber-50: #fff8e1;
-  --color-blue-200: #90caf9;
-  --color-blue-900: #0d47a1;
-  --color-blue-A700: #2962ff;
-  --color-cyan-500: #00bcd4;
-  --color-gray-100: #f5f5f5;
-  --color-gray-300: #cfcfcf;
-  --color-gray-200: #e0e0e0;
-  --color-gray-400: #bdbdbd;
-  --color-gray-50: #fafafa;
-  --color-gray-500: #9e9e9e;
-  --color-gray-600: #757575;
-  --color-gray-700: #616161;
-  --color-gray-800: #424242;
-  --color-gray-900: #212121;
-  --color-gray: #000000;
-  --color-green-700: #018642;
-  --color-green: #0cce6b;
-  --color-lime-400: #d3e156;
-  --color-orange-50: #fff3e0;
-  --color-orange-700: #d04900;
-  --color-orange: #ffa400;
-  --color-red-700: #eb0f00;
-  --color-red: #ff4e42;
-  --color-teal-600: #00897b;
-  --color-white: #ffffff;
-  --color-average-secondary: var(--color-orange-700);
-  --color-average: var(--color-orange);
-  --color-fail-secondary: var(--color-red-700);
-  --color-fail: var(--color-red);
-  --color-hover: var(--color-gray-50);
-  --color-informative: var(--color-blue-900);
-  --color-pass-secondary: var(--color-green-700);
-  --color-pass: var(--color-green);
-  --color-not-applicable: var(--color-gray-600);
-}
-/* Color classes are now handled in template via gaugeColorClasses computed */
-
-.guage__wrapper--not-applicable {
-  color: var(--color-not-applicable);
-  fill: var(--color-not-applicable);
-  stroke: var(--color-not-applicable);
-}
+<style scoped>
 .guage__wrapper--huge {
   --gauge-circle-size: 40px;
 }
@@ -144,10 +120,9 @@ const guageArcStyle = computed(() => {
   align-items: center;
   flex-direction: column;
   text-decoration: none;
-  padding: var(--score-container-padding);
   --transition-length: 1s;
   contain: content;
-  will-change: opacity;
+  will-change: transform, opacity;
 }
 .guage__svg-wrapper {
   position: relative;
@@ -168,3 +143,4 @@ const guageArcStyle = computed(() => {
   animation-delay: 250ms;
 }
 </style>
+

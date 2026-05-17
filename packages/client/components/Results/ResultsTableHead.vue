@@ -41,7 +41,7 @@ function htmlTooltip(s: string) {
         v-if="(column.sortable || !!column.sortKey) && column.key"
         class="ml-2 w-11 h-11 flex items-center justify-center dark:border-none dark:bg-blue-900/20 border-2 border-blue-100 ring-blue-200 hover:ring-1 rounded-lg"
         :class="sorting.key === column.key && sorting.dir ? ['dark:bg-blue-900/70', 'bg-blue-900', 'text-blue-200'] : []"
-        :aria-label="'Sort by ' + column.label"
+        :aria-label="`Sort by ${column.label}`"
         @click="$emit('sort', column.key)"
       >
         <UIcon v-if="sorting.key !== column.key || !sorting.dir" name="i-carbon-chevron-sort" />

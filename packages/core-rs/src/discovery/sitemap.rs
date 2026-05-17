@@ -4,6 +4,7 @@ use futures::FutureExt;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use tracing::{debug, warn};
+use futures::stream::{self, StreamExt};
 
 use crate::util::is_same_origin;
 
@@ -162,10 +163,20 @@ pub async fn extract_sitemap_routes(
     };
 
     let mut all_urls: Vec<String> = Vec::new();
-    for sm_url in &effective_sitemaps {
-        match fetch_sitemap_urls(client, sm_url, site, 0).await {
+    let mut stream = stream::iter(effective_sitemaps)
+        .map(|sm_url| {
+            let client = client.clone();
+            let site = site.to_string();
+            async move {
+                fetch_sitemap_urls(&client, &sm_url, &site, 0).await
+            }
+        })
+        .buffer_unordered(5);
+
+    while let Some(res) = stream.next().await {
+        match res {
             Ok(urls) => all_urls.extend(urls),
-            Err(e) => warn!("Sitemap error for {sm_url}: {e}"),
+            Err(e) => warn!("Sitemap error: {e}"),
         }
     }
 

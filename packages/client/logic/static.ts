@@ -55,16 +55,17 @@ export function resolveArtifactPath(report: UnlighthouseRouteReport, file: strin
   }
   const withoutBase = report.artifactUrl.replace(basePath, '')
 
-  if (isStatic) {
-    // Clean up the pathname to remove trailing /index.html and similar artifacts
-    let cleanPathname = window.location.pathname
-    // Remove common static file names that shouldn't be part of the base path
-    cleanPathname = cleanPathname.replace(/\/index\.html$/, '')
-
-    return joinURL(cleanPathname, withoutBase, file)
+  // Clean up the pathname to remove trailing /index.html and similar artifacts
+  let cleanPathname = window.location.pathname
+  if (cleanPathname.endsWith('/index.html')) {
+    cleanPathname = cleanPathname.slice(0, -11)
+  }
+  // Ensure it ends with / for joinURL
+  if (!cleanPathname.endsWith('/')) {
+    cleanPathname += '/'
   }
 
-  return joinURL(window.location.pathname, withoutBase, file) // dynamic base
+  return joinURL(cleanPathname, withoutBase, file)
 }
 
 export { apiUrl, basePath, device, dynamicSampling, groupRoutesKey, lighthouseOptions, throttle, wsUrl }

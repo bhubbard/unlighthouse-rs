@@ -10,7 +10,6 @@ mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -108,6 +107,18 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
 
+    /// Skip JavaScript execution (experimental)
+    #[arg(long)]
+    skip_javascript: bool,
+
+    /// Navigate to the URL before running Lighthouse
+    #[arg(long)]
+    warmup: bool,
+
+    /// Block images/fonts to speed up the audit
+    #[arg(long)]
+    block_assets: bool,
+
     /// Backend to use for HTML inspection.
     /// reqwest (default) is fast and needs no Chrome for step 1.
     /// headless_chrome is stable with all Chrome versions.
@@ -115,6 +126,22 @@ struct Cli {
     #[arg(long, default_value = "reqwest",
           value_parser = ["reqwest", "headless_chrome", "chromiumoxide"])]
     browser: String,
+
+    /// Start as an MCP (Model Context Protocol) server
+    #[arg(long)]
+    mcp: bool,
+
+    /// LHCI server host (e.g. https://lhci.example.com)
+    #[arg(long)]
+    lhci_host: Option<String>,
+
+    /// LHCI build token
+    #[arg(long)]
+    lhci_build_token: Option<String>,
+
+    /// LHCI server basic auth token
+    #[arg(long)]
+    lhci_auth: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -136,22 +163,28 @@ async fn main() -> Result<()> {
     let overrides = CliOverrides {
         site: cli.site.clone(),
         output_path: cli.output_path.clone(),
-        debug: cli.debug,
-        no_cache: cli.no_cache,
+        debug: cli.debug.then_some(true),
+        no_cache: cli.no_cache.then_some(true),
         device: cli.device.clone(),
         samples: cli.samples,
-        throttle: cli.throttle,
+        throttle: cli.throttle.then_some(true),
         max_routes: cli.max_routes,
         reporter: cli.reporter.clone(),
-        build_static: cli.build_static,
+        build_static: cli.build_static.then_some(true),
         budget: cli.budget,
         workers: cli.workers,
-        ci: cli.ci,
+        ci: cli.ci.then_some(true),
         port: Some(cli.port),
         host: Some(cli.host.clone()),
         lighthouse_process_path: cli.lighthouse_process_path.clone(),
-        include: cli.include.clone(),
-        exclude: cli.exclude.clone(),
+        include: (!cli.include.is_empty()).then(|| cli.include.clone()),
+        exclude: (!cli.exclude.is_empty()).then(|| cli.exclude.clone()),
+        skip_javascript: cli.skip_javascript.then_some(true),
+        warmup: cli.warmup.then_some(true),
+        block_assets: cli.block_assets.then_some(true),
+        lhci_host: cli.lhci_host.clone(),
+        lhci_build_token: cli.lhci_build_token.clone(),
+        lhci_auth: cli.lhci_auth.clone(),
     };
 
     let config = config::load_config(cli.config_file.as_ref(), overrides)
@@ -160,6 +193,23 @@ async fn main() -> Result<()> {
     if config.site.is_empty() {
         anyhow::bail!("--site is required. Provide a URL like https://example.com");
     }
+
+    // If running in normal server mode, bind to the port early to fail fast
+    // if the address is already in use, preventing unnecessary heavy initialization.
+    let listener = if !config.ci.enabled && !cli.mcp {
+        let addr = tokio::net::lookup_host(format!("{}:{}", config.host, config.port))
+            .await
+            .context("Failed to resolve host")?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No address found for {}:{}", config.host, config.port))?;
+
+        let l = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind to address {addr}"))?;
+        Some(l)
+    } else {
+        None
+    };
 
     info!("unlighthouse-rs starting — site: {}", config.site);
     info!(
@@ -187,16 +237,16 @@ async fn main() -> Result<()> {
     info!(backend = %cli.browser, "Initialising HTML inspection backend...");
     let browser = match cli.browser.as_str() {
         "chromiumoxide" => {
-            launch_chromiumoxide()
+            launch_chromiumoxide(&config)
                 .await
                 .context("Failed to launch Chrome via chromiumoxide")?
         }
         "headless_chrome" => {
-            launch_headless_chrome()
+            launch_headless_chrome(&config)
                 .context("Failed to launch Chrome via headless_chrome")?
         }
         _ => {
-            launch_reqwest()
+            launch_reqwest(&config)
                 .context("Failed to create reqwest client")?
         }
     };
@@ -206,7 +256,21 @@ async fn main() -> Result<()> {
     let (work_tx, work_rx) = tokio::sync::mpsc::channel::<types::NormalisedRoute>(1024);
 
     // App state (shared with server + workers)
-    let state = Arc::new(AppState::new(config.clone(), work_tx.clone()));
+    // Initialize the persistent worker pool if configured
+    let pool = if !config.lighthouse_process_path.is_empty() && config.workers > 0 {
+        match queue::pool::LighthousePool::new(&config, config.workers).await {
+            Ok(p) => Some(Arc::new(p)),
+            Err(e) => {
+                warn!("Failed to initialize persistent worker pool: {e}. Falling back to one-off processes.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // App state (shared with server + workers)
+    let state = Arc::new(server::AppState::new(Arc::clone(&config), work_tx.clone(), pool));
 
     // ── Route discovery (uses reqwest — no browser needed for sitemaps/robots) ─
     info!("Starting route discovery...");
@@ -232,26 +296,24 @@ async fn main() -> Result<()> {
         return run_ci_mode(state, config, worker_handle).await;
     }
 
-    // ── Server mode: start HTTP server + keep running ─────────────────────────
-    // Use lookup_host so that "localhost" resolves correctly (SocketAddr::parse
-    // only accepts IP literals, not hostnames).
-    let addr: SocketAddr = tokio::net::lookup_host(format!("{}:{}", config.host, config.port))
-        .await
-        .context("Failed to resolve host")?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No address found for {}:{}", config.host, config.port))?;
-
-    info!(
-        "Dashboard: http://{}{}",
-        addr,
-        if config.router_prefix.is_empty() {
-            String::new()
-        } else {
-            config.router_prefix.clone()
-        }
-    );
-
-    start_server(state, addr).await?;
+    // ── Server mode: start HTTP server or MCP server + keep running ───────────
+    if cli.mcp {
+        info!("Starting MCP server...");
+        server::mcp::run_mcp_server(state.clone()).await?;
+    } else {
+        let listener = listener.ok_or_else(|| anyhow::anyhow!("TCP listener was not initialized"))?;
+        let addr = listener.local_addr()?;
+        info!(
+            "Dashboard: http://{}{}",
+            addr,
+            if config.router_prefix.is_empty() {
+                String::new()
+            } else {
+                config.router_prefix.clone()
+            }
+        );
+        start_server(state, listener).await?;
+    }
     Ok(())
 }
 
@@ -311,8 +373,14 @@ async fn run_ci_mode(
 
     // Write report
     if config.ci.reporter != ReporterType::None {
-        match write_report(&reports, &config.ci.reporter, &config.output_path).await {
-            Ok(Some(path)) => info!("Report written: {path}"),
+        match write_report(&reports, &config).await {
+            Ok(Some(path)) => {
+                if config.ci.reporter == ReporterType::Lhci {
+                    info!("LHCI Upload complete. Build comparison URL: {path}");
+                } else {
+                    info!("Report written: {path}");
+                }
+            }
             Ok(None) => {}
             Err(e) => error!("Failed to write report: {e}"),
         }

@@ -1,5 +1,7 @@
 pub mod csv;
 pub mod json;
+pub mod markdown;
+pub mod lhci;
 
 use anyhow::Result;
 use std::path::Path;
@@ -8,17 +10,22 @@ use tracing::info;
 use crate::config::ReporterType;
 use crate::types::RouteReport;
 
-/// Write the configured report to the output path and return the file path written.
+/// Write the configured report to the output path and return the file path written or compare URL.
 pub async fn write_report(
     reports: &[RouteReport],
-    reporter: &ReporterType,
-    output_path: &str,
+    config: &crate::config::Config,
 ) -> Result<Option<String>> {
+    let reporter = &config.ci.reporter;
     if *reporter == ReporterType::None {
         return Ok(None);
     }
 
-    let out_dir = Path::new(output_path);
+    if *reporter == ReporterType::Lhci {
+        let compare_url = lhci::upload_to_lhci_server(reports, config).await?;
+        return Ok(Some(compare_url));
+    }
+
+    let out_dir = Path::new(&config.output_path);
     tokio::fs::create_dir_all(out_dir).await?;
 
     let (filename, content) = match reporter {
@@ -31,7 +38,10 @@ pub async fn write_report(
         ReporterType::JsonExpanded => {
             ("report-expanded.json", json::report_json_expanded(reports)?)
         }
-        ReporterType::None => unreachable!(),
+        ReporterType::Markdown => {
+            ("report.md", markdown::report_markdown(reports)?)
+        }
+        ReporterType::None | ReporterType::Lhci => unreachable!(),
     };
 
     let file_path = out_dir.join(filename);

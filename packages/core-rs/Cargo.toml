@@ -11,18 +11,30 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = [ "full" ] }
 
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = [
+  "derive",
+  "env"
+] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = [ "derive" ] }
 serde_json = "1"
 toml = "0.8"
+base64 = "0.22"
+regex = "1.10"
 
 # HTTP client — use rustls so we don't need system OpenSSL dev headers
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls", "charset", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "gzip",
+  "rustls-tls",
+  "charset",
+  "http2",
+  "cookies"
+] }
 
 # HTML parsing (used during URL discovery / static crawl)
 scraper = "0.20"
@@ -31,16 +43,23 @@ scraper = "0.20"
 # headless_chrome: sync API, stable with all Chrome versions (default)
 # chromiumoxide:   async/tokio-native CDP (may crash on some Chrome internal events)
 headless_chrome = "1"
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.7", features = [ "tokio-runtime" ] }
 
 # Web server
-axum = { version = "0.7", features = ["ws", "macros"] }
+axum = { version = "0.7", features = [
+  "ws",
+  "macros"
+] }
 tower = "0.4"
-tower-http = { version = "0.6", features = ["fs", "cors", "trace", "compression-full"] }
-
+tower-http = { version = "0.6", features = [
+  "fs",
+  "cors",
+  "trace",
+  "compression-full"
+] }
 
 # XML parsing for sitemaps
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.36", features = [ "serialize" ] }
 
 # Error handling
 anyhow = "1"
@@ -48,13 +67,17 @@ thiserror = "1"
 
 # Logging / tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = [
+  "env-filter",
+  "fmt"
+] }
 
 # Hashing (for route IDs)
 md5 = "0.7"
 
 # URL parsing
 url = "2"
+urlencoding = "2.1"
 
 # CSV writing
 csv = "1"
@@ -63,17 +86,23 @@ csv = "1"
 glob = "0.3"
 
 # Concurrency utilities
-tokio-util = { version = "0.7", features = ["full"] }
+tokio-util = { version = "0.7", features = [ "full" ] }
 
 # Process detection
 num_cpus = "1"
 
-
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = [ "serde" ] }
 
 # Futures utilities (needed for chromiumoxide handler StreamExt)
 futures = "0.3"
+
+# Asset embedding
+rust-embed = "8"
+mime_guess = "2"
+
+# Image processing
+image = "0.25"
 
 [profile.release]
 opt-level = 3

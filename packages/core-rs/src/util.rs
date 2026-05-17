@@ -98,7 +98,24 @@ mod tests {
     fn test_is_html_path() {
         assert!(is_html_path("/about"));
         assert!(is_html_path("/about/"));
+        assert!(is_html_path("/about?foo=bar"));
         assert!(!is_html_path("/style.css"));
-        assert!(!is_html_path("/logo.png"));
+        assert!(!is_html_path("/logo.png?v=123"));
+        assert!(!is_html_path("/api/data.json"));
+    }
+
+    #[test]
+    fn test_resolve_url() {
+        let site = "https://example.com/base/";
+        assert_eq!(resolve_url(site, "/abs"), Some("https://example.com/abs".to_string()));
+        assert_eq!(resolve_url(site, "rel"), Some("https://example.com/base/rel".to_string()));
+        assert_eq!(resolve_url(site, "https://other.com"), Some("https://other.com".to_string()));
+    }
+
+    #[test]
+    fn test_url_to_path() {
+        assert_eq!(url_to_path("https://example.com/foo/bar"), "/foo/bar");
+        assert_eq!(url_to_path("https://example.com/"), "/");
+        assert_eq!(url_to_path("https://example.com"), "/");
     }
 }

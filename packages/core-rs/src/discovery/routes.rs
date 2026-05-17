@@ -59,7 +59,7 @@ async fn fetch_robots_rules(
 }
 
 /// Apply include/exclude filters to a path.
-fn passes_filters(path: &str, include: &[String], exclude: &[String]) -> bool {
+pub fn passes_filters(path: &str, include: &[String], exclude: &[String]) -> bool {
     // If include list is set, path must match at least one
     if !include.is_empty() {
         let matches_include = include.iter().any(|pat| path_matches(path, pat));
@@ -78,9 +78,20 @@ fn passes_filters(path: &str, include: &[String], exclude: &[String]) -> bool {
 }
 
 /// Returns true if `path` matches the include/exclude `pattern`.
+/// Regex patterns (surrounded by slashes /re/ or starting with ^) are matched using the `regex` crate.
 /// Glob wildcards (`*`, `?`) are supported via the `glob` crate.
 /// Plain patterns are matched as a prefix.
 fn path_matches(path: &str, pattern: &str) -> bool {
+    if (pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() > 2) || pattern.starts_with('^') {
+        let re_str = if pattern.starts_with('/') && pattern.ends_with('/') {
+            &pattern[1..pattern.len() - 1]
+        } else {
+            pattern
+        };
+        if let Ok(re) = regex::Regex::new(re_str) {
+            return re.is_match(path);
+        }
+    }
     if pattern.contains('*') || pattern.contains('?') {
         glob_match(pattern, path)
     } else {

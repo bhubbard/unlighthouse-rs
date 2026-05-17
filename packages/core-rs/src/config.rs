@@ -13,6 +13,8 @@ pub enum ReporterType {
     JsonSimple,
     JsonExpanded,
     CsvSimple,
+    Markdown,
+    Lhci,
 }
 
 impl std::str::FromStr for ReporterType {
@@ -22,6 +24,8 @@ impl std::str::FromStr for ReporterType {
             "jsonSimple" | "json-simple" | "json" => Ok(Self::JsonSimple),
             "jsonExpanded" | "json-expanded" => Ok(Self::JsonExpanded),
             "csvSimple" | "csv-simple" | "csv" => Ok(Self::CsvSimple),
+            "markdown" | "md" => Ok(Self::Markdown),
+            "lhci" | "lhciServer" | "lhci-server" => Ok(Self::Lhci),
             "none" | "false" => Ok(Self::None),
             other => anyhow::bail!("Unknown reporter: {other}"),
         }
@@ -63,6 +67,8 @@ pub struct ScannerConfig {
     pub throttle: bool,
     pub device: Device,
     pub skip_javascript: bool,
+    pub warmup: bool,
+    pub block_assets: bool,
     pub exclude: Vec<String>,
     pub include: Vec<String>,
 }
@@ -79,6 +85,8 @@ impl Default for ScannerConfig {
             throttle: false,
             device: Device::Mobile,
             skip_javascript: false,
+            warmup: false,
+            block_assets: false,
             exclude: vec![],
             include: vec![],
         }
@@ -94,6 +102,25 @@ pub struct CiConfig {
     pub build_static: bool,
     pub reporter: ReporterType,
     pub enabled: bool,
+    pub lhci_host: Option<String>,
+    pub lhci_build_token: Option<String>,
+    pub lhci_auth: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CookieConfig {
+    pub name: String,
+    pub value: String,
+    pub domain: Option<String>,
+    pub path: Option<String>,
 }
 
 // ── Top-level config (file + CLI merged) ──────────────────────────────────────
@@ -113,6 +140,12 @@ pub struct Config {
     pub lighthouse_process_path: String,
     pub ci: CiConfig,
     pub workers: usize,
+    pub auth: Option<AuthConfig>,
+    pub cookies: Option<Vec<CookieConfig>>,
+    pub local_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub session_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub extra_headers: Option<std::collections::HashMap<String, String>>,
+    pub user_agent: Option<String>,
 }
 
 impl Default for Config {
@@ -130,6 +163,12 @@ impl Default for Config {
             lighthouse_process_path: String::new(),
             ci: CiConfig::default(),
             workers: (num_cpus::get() / 2).max(1),
+            auth: None,
+            cookies: None,
+            local_storage: None,
+            session_storage: None,
+            extra_headers: None,
+            user_agent: None,
         }
     }
 }
@@ -152,6 +191,12 @@ struct FileConfig {
     workers: Option<usize>,
     scanner: Option<FileScannerConfig>,
     ci: Option<FileCiConfig>,
+    auth: Option<AuthConfig>,
+    cookies: Option<Vec<CookieConfig>>,
+    local_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
+    session_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
+    extra_headers: Option<std::collections::HashMap<String, String>>,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -166,6 +211,8 @@ struct FileScannerConfig {
     throttle: Option<bool>,
     device: Option<String>,
     skip_javascript: Option<bool>,
+    warmup: Option<bool>,
+    block_assets: Option<bool>,
     exclude: Option<Vec<String>>,
     include: Option<Vec<String>>,
 }
@@ -177,6 +224,9 @@ struct FileCiConfig {
     build_static: Option<bool>,
     reporter: Option<String>,
     enabled: Option<bool>,
+    lhci_host: Option<String>,
+    lhci_build_token: Option<String>,
+    lhci_auth: Option<String>,
 }
 
 // ── CLI args (passed in after parsing) ────────────────────────────────────────
@@ -185,22 +235,28 @@ struct FileCiConfig {
 pub struct CliOverrides {
     pub site: Option<String>,
     pub output_path: Option<String>,
-    pub debug: bool,
-    pub no_cache: bool,
+    pub debug: Option<bool>,
+    pub no_cache: Option<bool>,
     pub device: Option<String>,
     pub samples: Option<usize>,
-    pub throttle: bool,
+    pub throttle: Option<bool>,
     pub max_routes: Option<usize>,
     pub reporter: Option<String>,
-    pub build_static: bool,
+    pub build_static: Option<bool>,
     pub budget: Option<f64>,
     pub workers: Option<usize>,
-    pub ci: bool,
+    pub ci: Option<bool>,
     pub port: Option<u16>,
     pub host: Option<String>,
     pub lighthouse_process_path: Option<String>,
-    pub include: Vec<String>,
-    pub exclude: Vec<String>,
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+    pub skip_javascript: Option<bool>,
+    pub warmup: Option<bool>,
+    pub block_assets: Option<bool>,
+    pub lhci_host: Option<String>,
+    pub lhci_build_token: Option<String>,
+    pub lhci_auth: Option<String>,
 }
 
 // ── Config loading logic ──────────────────────────────────────────────────────
@@ -243,72 +299,175 @@ pub fn load_config(config_file: Option<&PathBuf>, overrides: CliOverrides) -> Re
     Ok(config)
 }
 
+macro_rules! merge_opt {
+    ($target:expr, $source:expr) => {
+        if let Some(v) = $source {
+            $target = v.into();
+        }
+    };
+}
+
+macro_rules! merge_parse {
+    ($target:expr, $source:expr, $err_msg:expr) => {
+        if let Some(v) = $source {
+            $target = v.parse().with_context(|| $err_msg)?;
+        }
+    };
+}
+
 fn apply_file_config(config: &mut Config, fc: FileConfig) -> Result<()> {
-    if let Some(v) = fc.site { config.site = v; }
-    if let Some(v) = fc.output_path { config.output_path = v; }
-    if let Some(v) = fc.debug { config.debug = v; }
-    if let Some(v) = fc.cache { config.cache = v; }
-    if let Some(v) = fc.router_prefix { config.router_prefix = v; }
-    if let Some(v) = fc.api_prefix { config.api_prefix = v; }
-    if let Some(v) = fc.port { config.port = v; }
-    if let Some(v) = fc.host { config.host = v; }
-    if let Some(v) = fc.lighthouse_process_path { config.lighthouse_process_path = v; }
-    if let Some(v) = fc.workers { config.workers = v; }
+    merge_opt!(config.site, fc.site);
+    merge_opt!(config.output_path, fc.output_path);
+    merge_opt!(config.debug, fc.debug);
+    merge_opt!(config.cache, fc.cache);
+    merge_opt!(config.router_prefix, fc.router_prefix);
+    merge_opt!(config.api_prefix, fc.api_prefix);
+    merge_opt!(config.port, fc.port);
+    merge_opt!(config.host, fc.host);
+    merge_opt!(config.lighthouse_process_path, fc.lighthouse_process_path);
+    merge_opt!(config.workers, fc.workers);
+    merge_opt!(config.auth, fc.auth);
+    merge_opt!(config.cookies, fc.cookies);
+    merge_opt!(config.local_storage, fc.local_storage);
+    merge_opt!(config.session_storage, fc.session_storage);
+    merge_opt!(config.extra_headers, fc.extra_headers);
+    merge_opt!(config.user_agent, fc.user_agent);
 
     if let Some(sc) = fc.scanner {
-        if let Some(v) = sc.max_routes { config.scanner.max_routes = Some(v); }
-        if let Some(v) = sc.crawler { config.scanner.crawler = v; }
-        if let Some(v) = sc.sitemap { config.scanner.sitemap = v; }
-        if let Some(v) = sc.robots_txt { config.scanner.robots_txt = v; }
-        if let Some(v) = sc.dynamic_sampling { config.scanner.dynamic_sampling = Some(v); }
-        if let Some(v) = sc.samples { config.scanner.samples = v; }
-        if let Some(v) = sc.throttle { config.scanner.throttle = v; }
-        if let Some(v) = sc.skip_javascript { config.scanner.skip_javascript = v; }
-        if let Some(v) = sc.exclude { config.scanner.exclude = v; }
-        if let Some(v) = sc.include { config.scanner.include = v; }
-        if let Some(v) = sc.device {
-            config.scanner.device = v.parse()
-                .with_context(|| format!("Invalid device value in config file: {v:?}. Expected: mobile | desktop"))?;
-        }
+        merge_opt!(config.scanner.max_routes, sc.max_routes);
+        merge_opt!(config.scanner.crawler, sc.crawler);
+        merge_opt!(config.scanner.sitemap, sc.sitemap);
+        merge_opt!(config.scanner.robots_txt, sc.robots_txt);
+        merge_opt!(config.scanner.dynamic_sampling, sc.dynamic_sampling);
+        merge_opt!(config.scanner.samples, sc.samples);
+        merge_opt!(config.scanner.throttle, sc.throttle);
+        merge_opt!(config.scanner.skip_javascript, sc.skip_javascript);
+        merge_opt!(config.scanner.warmup, sc.warmup);
+        merge_opt!(config.scanner.block_assets, sc.block_assets);
+        merge_opt!(config.scanner.exclude, sc.exclude);
+        merge_opt!(config.scanner.include, sc.include);
+        merge_parse!(config.scanner.device, sc.device, "Invalid device value in config file");
     }
 
     if let Some(ci) = fc.ci {
-        if let Some(v) = ci.budget { config.ci.budget = Some(v); }
-        if let Some(v) = ci.build_static { config.ci.build_static = v; }
-        if let Some(v) = ci.enabled { config.ci.enabled = v; }
-        if let Some(v) = ci.reporter {
-            config.ci.reporter = v.parse()
-                .with_context(|| format!("Invalid reporter value in config file: {v:?}. Expected: json | csv | jsonExpanded | none"))?;
-        }
+        merge_opt!(config.ci.budget, ci.budget);
+        merge_opt!(config.ci.build_static, ci.build_static);
+        merge_opt!(config.ci.enabled, ci.enabled);
+        merge_opt!(config.ci.lhci_host, ci.lhci_host);
+        merge_opt!(config.ci.lhci_build_token, ci.lhci_build_token);
+        merge_opt!(config.ci.lhci_auth, ci.lhci_auth);
+        merge_parse!(config.ci.reporter, ci.reporter, "Invalid reporter value in config file");
     }
 
     Ok(())
 }
 
 fn apply_cli_overrides(config: &mut Config, cli: CliOverrides) -> Result<()> {
-    if let Some(v) = cli.site { config.site = v; }
-    if let Some(v) = cli.output_path { config.output_path = v; }
-    if cli.debug { config.debug = true; }
-    if cli.no_cache { config.cache = false; }
-    if let Some(v) = cli.samples { config.scanner.samples = v; }
-    if cli.throttle { config.scanner.throttle = true; }
-    if let Some(v) = cli.max_routes { config.scanner.max_routes = Some(v); }
-    if let Some(v) = cli.workers { config.workers = v; }
-    if let Some(v) = cli.budget { config.ci.budget = Some(v); }
-    if cli.build_static { config.ci.build_static = true; }
-    if cli.ci { config.ci.enabled = true; }
-    if let Some(v) = cli.port { config.port = v; }
-    if let Some(v) = cli.host { config.host = v; }
-    if let Some(v) = cli.lighthouse_process_path { config.lighthouse_process_path = v; }
-    if !cli.include.is_empty() { config.scanner.include = cli.include; }
-    if !cli.exclude.is_empty() { config.scanner.exclude = cli.exclude; }
+    merge_opt!(config.site, cli.site);
+    merge_opt!(config.output_path, cli.output_path);
+    merge_opt!(config.debug, cli.debug);
+    if let Some(no_cache) = cli.no_cache { config.cache = !no_cache; }
+    merge_opt!(config.scanner.samples, cli.samples);
+    merge_opt!(config.scanner.throttle, cli.throttle);
+    merge_opt!(config.scanner.max_routes, cli.max_routes);
+    merge_opt!(config.workers, cli.workers);
+    merge_opt!(config.ci.budget, cli.budget);
+    merge_opt!(config.ci.build_static, cli.build_static);
+    merge_opt!(config.ci.enabled, cli.ci);
+    merge_opt!(config.port, cli.port);
+    merge_opt!(config.host, cli.host);
+    merge_opt!(config.lighthouse_process_path, cli.lighthouse_process_path);
+    merge_opt!(config.scanner.include, cli.include);
+    merge_opt!(config.scanner.exclude, cli.exclude);
+    merge_opt!(config.scanner.skip_javascript, cli.skip_javascript);
+    merge_opt!(config.scanner.warmup, cli.warmup);
+    merge_opt!(config.scanner.block_assets, cli.block_assets);
+    merge_opt!(config.ci.lhci_host, cli.lhci_host);
+    merge_opt!(config.ci.lhci_build_token, cli.lhci_build_token);
+    merge_opt!(config.ci.lhci_auth, cli.lhci_auth);
 
-    if let Some(device_str) = cli.device {
-        config.scanner.device = device_str.parse()?;
-    }
-    if let Some(reporter_str) = cli.reporter {
-        config.ci.reporter = reporter_str.parse()?;
-    }
+    merge_parse!(config.scanner.device, cli.device, "Invalid device value in CLI");
+    merge_parse!(config.ci.reporter, cli.reporter, "Invalid reporter value in CLI");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_reporter_type_parsing() {
+        assert_eq!("json".parse::<ReporterType>().unwrap(), ReporterType::JsonSimple);
+        assert_eq!("json-expanded".parse::<ReporterType>().unwrap(), ReporterType::JsonExpanded);
+        assert_eq!("markdown".parse::<ReporterType>().unwrap(), ReporterType::Markdown);
+        assert_eq!("none".parse::<ReporterType>().unwrap(), ReporterType::None);
+        assert!("invalid".parse::<ReporterType>().is_err());
+    }
+
+    #[test]
+    fn test_device_parsing() {
+        assert_eq!("mobile".parse::<Device>().unwrap(), Device::Mobile);
+        assert_eq!("desktop".parse::<Device>().unwrap(), Device::Desktop);
+        assert!("tablet".parse::<Device>().is_err());
+    }
+
+    #[test]
+    fn test_merge_opt_macro() {
+        let mut target = "original".to_string();
+        let source = Some("new".to_string());
+        merge_opt!(target, source);
+        assert_eq!(target, "new");
+
+        let source_none: Option<String> = None;
+        merge_opt!(target, source_none);
+        assert_eq!(target, "new"); // No change
+
+        // Test into() conversion (String to Option<String>)
+        let mut target_opt = Some("original".to_string());
+        let source = Some("new".to_string());
+        merge_opt!(target_opt, source);
+        assert_eq!(target_opt, Some("new".to_string()));
+    }
+
+    #[test]
+    fn test_apply_cli_overrides() {
+        let mut config = Config::default();
+        let overrides = CliOverrides {
+            site: Some("https://overridden.com".to_string()),
+            debug: Some(true),
+            no_cache: Some(true),
+            device: Some("desktop".to_string()),
+            ..Default::default()
+        };
+
+        apply_cli_overrides(&mut config, overrides).unwrap();
+
+        assert_eq!(config.site, "https://overridden.com");
+        assert!(config.debug);
+        assert!(!config.cache); // no_cache = true means cache = false
+        assert_eq!(config.scanner.device, Device::Desktop);
+    }
+
+    #[test]
+    fn test_apply_file_config() {
+        let mut config = Config::default();
+        let fc = FileConfig {
+            site: Some("https://file.com".to_string()),
+            port: Some(9999),
+            scanner: Some(FileScannerConfig {
+                max_routes: Some(10),
+                samples: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        apply_file_config(&mut config, fc).unwrap();
+
+        assert_eq!(config.site, "https://file.com");
+        assert_eq!(config.port, 9999);
+        assert_eq!(config.scanner.max_routes, Some(10));
+        assert_eq!(config.scanner.samples, 3);
+    }
 }

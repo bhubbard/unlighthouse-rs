@@ -73,10 +73,6 @@ pub async fn process_route(
 ) {
     let config = Arc::clone(&state.config);
 
-    // Acquire a concurrency permit before doing any work.
-    // Held for the full duration of this route's processing; dropped on return.
-    let permit = state.semaphore.acquire().await.expect("semaphore closed");
-
     // ── Register the route ────────────────────────────────────────────────────
     let mut report = create_route_report(&route, &config);
     {
@@ -85,70 +81,124 @@ pub async fn process_route(
     }
     broadcast_and_update(&state, WsEvent::TaskAdded(report.clone())).await;
 
-    // ── Step 1: HTML inspection ───────────────────────────────────────────────
-    report.tasks.inspect_html_task = TaskStatus::InProgress;
-    broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
+    // ── Step 1: HTML inspection (High Concurrency) ───────────────────────────
+    {
+        let _permit = state.discovery_semaphore.acquire().await.expect("semaphore closed");
+        
+        report.tasks.inspect_html_task = TaskStatus::InProgress;
+        broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
 
-    match browser.inspect_html(&route.url).await {
-        Ok((seo, discovered_links)) => {
-            report.seo = Some(seo);
-            report.tasks.inspect_html_task = TaskStatus::Completed;
+        match browser.inspect_html(&route.url).await {
+            Ok((seo, discovered_links)) => {
+                report.seo = Some(seo);
+                report.tasks.inspect_html_task = TaskStatus::Completed;
 
-            // Feed newly discovered internal links back into the work queue.
-            // Acquire the lock once for the whole batch to avoid TOCTOU races
-            // on the max_routes cap and to reduce lock contention.
-            if config.scanner.crawler {
-                let max = config.scanner.max_routes.unwrap_or(usize::MAX);
-                let mut reports = state.route_reports.write().await;
-                for href in discovered_links {
-                    if reports.len() >= max {
-                        break;
-                    }
-                    let new_route = normalise_route(&href, &config.site);
-                    if !reports.contains_key(&new_route.id) {
-                        // Pre-register so the next iteration sees the slot taken
-                        // even before the worker picks it up.
-                        reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
-                        let _ = state.work_tx.send(new_route).await;
+                if config.scanner.crawler {
+                    let max = config.scanner.max_routes.unwrap_or(usize::MAX);
+                    let mut reports = state.route_reports.write().await;
+                    for href in discovered_links {
+                        if reports.len() >= max {
+                            break;
+                        }
+                        let new_route = normalise_route(&href, &config.site);
+                        if crate::discovery::routes::passes_filters(&new_route.path, &config.scanner.include, &config.scanner.exclude) {
+                            if !reports.contains_key(&new_route.id) {
+                                reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
+                                let _ = state.work_tx.send(new_route).await;
+                            }
+                        }
                     }
                 }
             }
-        }
-        Err(e) => {
-            warn!(url = %route.url, error = %e, "HTML inspection failed");
-            report.tasks.inspect_html_task = TaskStatus::Failed;
-        }
-    }
-
-    {
-        let mut reports = state.route_reports.write().await;
-        reports.insert(route.id.clone(), report.clone());
-    }
-    broadcast_and_update(&state, WsEvent::TaskComplete(report.clone())).await;
-
-    // ── Step 2: Lighthouse audit (Node.js subprocess) ─────────────────────────
-    report.tasks.run_lighthouse_task = TaskStatus::InProgress;
-    broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
-
-    let artifact_path = PathBuf::from(&report.artifact_path);
-
-    if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
-        error!("Cannot create artifact dir {:?}: {e}", artifact_path);
-        report.tasks.run_lighthouse_task = TaskStatus::Failed;
-    } else {
-        match run_lighthouse(&route.url, &artifact_path, &config).await {
-            Ok(lh_report) => {
-                report.report = Some(lh_report);
-                report.tasks.run_lighthouse_task = TaskStatus::Completed;
-                info!(
-                    path  = %route.path,
-                    score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
-                    "Lighthouse complete"
-                );
-            }
             Err(e) => {
-                warn!(url = %route.url, error = %e, "Lighthouse failed");
-                report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                warn!(url = %route.url, error = %e, "HTML inspection failed");
+                report.tasks.inspect_html_task = TaskStatus::Failed;
+            }
+        }
+
+        {
+            let mut reports = state.route_reports.write().await;
+            reports.insert(route.id.clone(), report.clone());
+        }
+        broadcast_and_update(&state, WsEvent::TaskComplete(report.clone())).await;
+    }
+
+    // ── Step 2: Lighthouse audit (Controlled Concurrency via Pool) ────────────
+    {
+        let _permit = state.lighthouse_semaphore.acquire().await.expect("semaphore closed");
+        
+        report.tasks.run_lighthouse_task = TaskStatus::InProgress;
+        broadcast_and_update(&state, WsEvent::TaskStarted(report.clone())).await;
+
+        let artifact_path = PathBuf::from(&report.artifact_path);
+
+        if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
+            error!("Cannot create artifact dir {:?}: {e}", artifact_path);
+            report.tasks.run_lighthouse_task = TaskStatus::Failed;
+        } else {
+            // Use the pool if available, otherwise fallback to one-off
+            let res = if let Some(pool) = &state.lighthouse_pool {
+                // Determine a worker index (could be random or based on route id)
+                let worker_idx = route.id.chars().next().unwrap_or('0') as usize;
+                let worker = pool.get_worker(worker_idx).await;
+                let mut worker = worker.lock().await;
+                
+                let device_str = match config.scanner.device {
+                    crate::config::Device::Desktop => "desktop",
+                    _ => "mobile",
+                };
+                
+                worker.audit(crate::queue::pool::AuditTask {
+                    url: route.url.clone(),
+                    output_dir: report.artifact_path.clone(),
+                    device: device_str.to_string(),
+                    throttle: config.scanner.throttle,
+                    skip_javascript: config.scanner.skip_javascript,
+                    block_assets: config.scanner.block_assets,
+                    warmup: config.scanner.warmup,
+                    auth: config.auth.clone(),
+                    cookies: config.cookies.clone(),
+                    local_storage: config.local_storage.clone(),
+                    session_storage: config.session_storage.clone(),
+                    extra_headers: config.extra_headers.clone(),
+                    user_agent: config.user_agent.clone(),
+                }).await
+            } else {
+                // Fallback to one-off process (backward compatibility)
+                run_lighthouse_fallback(&route.url, &artifact_path, &config).await
+                    .map(|r| crate::queue::pool::AuditResult {
+                        success: true,
+                        url: route.url.clone(),
+                        scores: Some(r.categories.iter().map(|(k, v)| (k.clone(), v.score.unwrap_or(0.0))).collect()),
+                        error: None,
+                    })
+                    .map_err(|e| e)
+            };
+
+            match res {
+                Ok(audit_res) if audit_res.success => {
+                    // Re-parse the report.json to get full audits
+                    let json_path = artifact_path.join("report.json");
+                    if let Ok(json) = tokio::fs::read_to_string(json_path).await {
+                        if let Ok(lh_report) = parse_lighthouse_report(&serde_json::from_str(&json).unwrap()) {
+                             report.report = Some(lh_report);
+                        }
+                    }
+                    report.tasks.run_lighthouse_task = TaskStatus::Completed;
+                    info!(
+                        path  = %route.path,
+                        score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
+                        "Lighthouse complete"
+                    );
+                }
+                Ok(audit_res) => {
+                    warn!(url = %route.url, error = ?audit_res.error, "Lighthouse failed");
+                    report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                }
+                Err(e) => {
+                    warn!(url = %route.url, error = %e, "Lighthouse pool audit failed");
+                    report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                }
             }
         }
     }
@@ -158,17 +208,12 @@ pub async fn process_route(
         reports.insert(route.id.clone(), report.clone());
     }
     broadcast_and_update(&state, WsEvent::TaskComplete(report)).await;
-
-    // Release the concurrency slot explicitly so intent is clear at a glance.
-    drop(permit);
 }
 
 // ── Lighthouse subprocess ─────────────────────────────────────────────────────
 
-/// Invoke the Lighthouse Node.js worker and parse its JSON output.
-///
-/// The worker is expected to write `report.json` into `artifact_path`.
-async fn run_lighthouse(
+/// Invoke the Lighthouse Node.js worker (one-off fallback) and parse its JSON output.
+async fn run_lighthouse_fallback(
     url: &str,
     artifact_path: &PathBuf,
     config: &Config,
@@ -190,6 +235,15 @@ async fn run_lighthouse(
     if config.scanner.throttle {
         cmd.arg("--throttle");
     }
+    if config.scanner.skip_javascript {
+        cmd.arg("--skip-javascript");
+    }
+    if config.scanner.warmup {
+        cmd.arg("--warmup");
+    }
+    if config.scanner.block_assets {
+        cmd.arg("--block-assets");
+    }
 
     let output = cmd.output().await?;
 
@@ -201,7 +255,15 @@ async fn run_lighthouse(
         ));
     }
 
-    let json = tokio::fs::read_to_string(artifact_path.join("report.json")).await?;
+    let json_path = artifact_path.join("report.json");
+    if !json_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Lighthouse finished successfully but 'report.json' is missing in {:?}. Check worker logs.",
+            artifact_path
+        ));
+    }
+
+    let json = tokio::fs::read_to_string(json_path).await?;
     parse_lighthouse_report(&serde_json::from_str(&json)?)
 }
 

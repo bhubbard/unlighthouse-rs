@@ -1,7 +1,9 @@
 <script lang="ts" setup>
 import type { UnlighthouseColumn, UnlighthouseRouteReport } from '@unlighthouse/core'
-import { apiUrl, categories, device, isOffline, resolveArtifactPath } from '../../logic'
+import { apiUrl, categories, device, isOffline } from '../../logic'
+import { useUnlighthouseStore } from '../../stores/unlighthouse'
 
+const store = useUnlighthouseStore()
 const props = defineProps<{
   report: UnlighthouseRouteReport
   column: UnlighthouseColumn
@@ -45,12 +47,12 @@ const thumbnail = computed(() => {
 
   if (categories.includes('performance')) {
     return {
-      src: resolveArtifactPath(props.report, '/screenshot.jpeg'),
+      src: store.resolveArtifactPath(props.report, '/screenshot.jpeg'),
       ...mobileProps,
     }
   }
   return {
-    src: resolveArtifactPath(props.report, '/full-screenshot.jpeg'),
+    src: store.resolveArtifactPath(props.report, '/full-screenshot.jpeg'),
     ...mobileProps,
   }
 })
@@ -65,7 +67,7 @@ const thumbnail = computed(() => {
         </btn-action>
       </template>
       <template #modal>
-        <img :src="resolveArtifactPath(props.report, '/full-screenshot.jpeg')" alt="full screenshot" class="mx-auto">
+        <img :src="store.resolveArtifactPath(props.report, '/full-screenshot.jpeg')" alt="full screenshot" class="mx-auto">
       </template>
     </modal-trigger>
 

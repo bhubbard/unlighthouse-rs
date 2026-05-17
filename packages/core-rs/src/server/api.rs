@@ -1,7 +1,8 @@
 use axum::{
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use std::sync::Arc;
@@ -106,6 +107,56 @@ pub async fn rescan_one(
         StatusCode::OK
     } else {
         StatusCode::NOT_FOUND
+    }
+}
+
+/// GET /api/crux/*site — proxy to crux.unlighthouse.dev
+pub async fn get_crux_history(
+    Path(site): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Axum's wildcard matcher decodes percent encoding, so we get something like:
+    // "https:/www.calljacob.com/history" or "https://www.calljacob.com/history"
+    // Let's strip the "/history" suffix.
+    let site = site.strip_suffix("/history").unwrap_or(&site).to_string();
+
+    // Reconstruct consecutive slashes if they were collapsed during routing/decoding
+    let site = if site.starts_with("https:/") && !site.starts_with("https://") {
+        site.replacen("https:/", "https://", 1)
+    } else if site.starts_with("http:/") && !site.starts_with("http://") {
+        site.replacen("http:/", "http://", 1)
+    } else {
+        site
+    };
+
+    // Percent-encode the site URL for the target API request
+    let encoded_site = urlencoding::encode(&site);
+    let url = format!("https://crux.unlighthouse.dev/api/{}/crux/history", encoded_site);
+    info!("Proxying CrUX request for: {} (encoded: {})", site, encoded_site);
+
+    match state.http_client.get(&url).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                let body = resp.bytes().await.unwrap_or_default();
+                (status, body).into_response()
+            } else {
+                info!("CrUX proxy returned non-success code {} for site: {}. Gracefully returning empty crux data JSON.", status, site);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"exists":false}"#))
+                    .unwrap()
+            }
+        }
+        Err(e) => {
+            tracing::error!("CrUX proxy error: {}", e);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"exists":false}"#))
+                .unwrap()
+        }
     }
 }
 

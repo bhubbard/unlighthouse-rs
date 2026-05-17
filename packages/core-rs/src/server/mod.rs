@@ -1,4 +1,5 @@
 pub mod api;
+pub mod mcp;
 pub mod websocket;
 
 use std::collections::HashMap;
@@ -25,20 +26,28 @@ use crate::types::{NormalisedRoute, RouteReport};
 
 use self::websocket::{ws_handler, WsBroadcast};
 
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../client/dist/"]
+struct Assets;
+
 /// Central shared state for the Axum server.
 pub struct AppState {
     pub route_reports: RwLock<HashMap<String, RouteReport>>,
     pub ws_tx: WsBroadcast,
     pub config: Arc<Config>,
-    pub semaphore: Arc<Semaphore>,
-    /// Channel to push routes into the worker queue
+    pub lighthouse_semaphore: Arc<Semaphore>,
+    pub discovery_semaphore: Arc<Semaphore>,
+    pub lighthouse_pool: Option<Arc<crate::queue::pool::LighthousePool>>,
     pub work_tx: tokio::sync::mpsc::Sender<NormalisedRoute>,
+    /// Shared HTTP client for proxying (CrUX)
+    pub http_client: reqwest::Client,
 }
 
 impl AppState {
     pub fn new(
         config: Arc<Config>,
         work_tx: tokio::sync::mpsc::Sender<NormalisedRoute>,
+        lighthouse_pool: Option<Arc<crate::queue::pool::LighthousePool>>,
     ) -> Self {
         let (ws_tx, _) = broadcast::channel(1024);
         let workers = config.workers;
@@ -46,8 +55,11 @@ impl AppState {
             route_reports: RwLock::new(HashMap::new()),
             ws_tx,
             config,
-            semaphore: Arc::new(Semaphore::new(workers)),
+            lighthouse_semaphore: Arc::new(Semaphore::new(workers)),
+            discovery_semaphore: Arc::new(Semaphore::new(50)), // High concurrency for discovery
+            lighthouse_pool,
             work_tx,
+            http_client: reqwest::Client::new(),
         }
     }
 }
@@ -141,19 +153,25 @@ async fn index_handler(State(state): State<Arc<AppState>>) -> Response {
     let html = match tokio::fs::read_to_string(&index_path).await {
         Ok(h) => h,
         Err(_) => {
-            let msg = format!(
-                "index.html not found at {index_path:?}.\n\
-                 Build the client first:\n\
-                   cd packages/client && pnpm build\n\
-                 Then copy the output:\n\
-                   mkdir -p {dir}/client && cp -r packages/client/dist/ {dir}/client/",
-                dir = state.config.output_path
-            );
-            return Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Body::from(msg))
-                .unwrap();
+            // Fallback to embedded asset
+            match Assets::get("index.html") {
+                Some(embedded) => String::from_utf8_lossy(&embedded.data).to_string(),
+                None => {
+                    let msg = format!(
+                        "index.html not found at {index_path:?}.\n\
+                         Build the client first:\n\
+                           cd packages/client && pnpm build\n\
+                         Then copy the output:\n\
+                           mkdir -p {dir}/client && cp -r packages/client/dist/ {dir}/client/",
+                        dir = state.config.output_path
+                    );
+                    return Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                        .body(Body::from(msg))
+                        .unwrap();
+                }
+            }
         }
     };
 
@@ -206,11 +224,23 @@ async fn favicon_handler(State(state): State<Arc<AppState>>) -> Response {
                 .unwrap()
         },
         Err(e) => {
-            warn!("Failed to read favicon at {:?}: {}", logo_path, e);
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .unwrap()
+            debug!("Failed to read favicon at {:?}: {}, falling back to embedded assets/logo.svg", logo_path, e);
+            match Assets::get("assets/logo.svg") {
+                Some(content) => {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/svg+xml")
+                        .body(Body::from(content.data))
+                        .unwrap()
+                }
+                None => {
+                    warn!("Embedded assets/logo.svg not found for favicon fallback");
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }
         },
     }
 }
@@ -273,7 +303,7 @@ async fn add_security_headers(req: axum::extract::Request, next: axum::middlewar
 /// Build and start the Axum HTTP server.
 pub async fn start_server(
     state: Arc<AppState>,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let output_path = PathBuf::from(&state.config.output_path);
     let client_dir = output_path.join("client");
@@ -284,11 +314,12 @@ pub async fn start_server(
 
     // API routes
     let api_router = Router::new()
-        .route("/reports", get(api::get_reports))
-        .route("/scan-meta", get(api::get_scan_meta))
-        .route("/reports/rescan", post(api::rescan_all))
-        .route("/reports/:id/rescan", post(api::rescan_one))
-        .route("/ws", get(ws_handler))
+        .route("/api/reports", get(api::get_reports))
+        .route("/api/scan-meta", get(api::get_scan_meta))
+        .route("/api/reports/rescan", post(api::rescan_all))
+        .route("/api/reports/:id/rescan", post(api::rescan_one))
+        .route("/api/crux/*site", get(api::get_crux_history))
+        .route("/api/ws", get(ws_handler))
         .with_state(state.clone());
 
     // Serve index.html with injected payload at root and /index.html
@@ -311,12 +342,30 @@ pub async fn start_server(
         .allow_methods(Any)
         .allow_headers(Any);
 
+    let asset_service = axum::routing::get(|uri: axum::http::Uri| async move {
+        let path = uri.path().trim_start_matches('/');
+        match Assets::get(path) {
+            Some(content) => {
+                let mime = mime_guess::from_path(path).first_or_octet_stream();
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, mime.as_ref())
+                    .body(Body::from(content.data))
+                    .unwrap()
+            }
+            None => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap(),
+        }
+    });
+
     let app = Router::new()
-        .nest("/api", api_router)
+        .merge(api_router)
         .merge(index_router)
         .fallback_service(
             ServeDir::new(&client_dir)
-                .fallback(artifact_service)
+                .fallback(artifact_service.fallback(asset_service))
         )
         .layer(cors)
         .layer(CompressionLayer::new())
@@ -329,7 +378,7 @@ pub async fn start_server(
         Router::new().nest(&router_prefix, app)
     };
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     info!("Server listening on http://{addr}");
     axum::serve(listener, final_app).await?;
     Ok(())
