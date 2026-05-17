@@ -146,6 +146,9 @@ pub struct Config {
     pub session_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
     pub extra_headers: Option<std::collections::HashMap<String, String>>,
     pub user_agent: Option<String>,
+    /// Google CrUX History API key. When set the Rust binary calls the CrUX API
+    /// directly; when absent it falls back to proxying crux.unlighthouse.dev.
+    pub crux_api_token: Option<String>,
 }
 
 impl Default for Config {
@@ -169,6 +172,7 @@ impl Default for Config {
             session_storage: None,
             extra_headers: None,
             user_agent: None,
+            crux_api_token: None,
         }
     }
 }
@@ -197,6 +201,7 @@ struct FileConfig {
     session_storage: Option<std::collections::HashMap<String, serde_json::Value>>,
     extra_headers: Option<std::collections::HashMap<String, String>>,
     user_agent: Option<String>,
+    crux_api_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -257,6 +262,7 @@ pub struct CliOverrides {
     pub lhci_host: Option<String>,
     pub lhci_build_token: Option<String>,
     pub lhci_auth: Option<String>,
+    pub crux_api_token: Option<String>,
 }
 
 // ── Config loading logic ──────────────────────────────────────────────────────
@@ -332,6 +338,7 @@ fn apply_file_config(config: &mut Config, fc: FileConfig) -> Result<()> {
     merge_opt!(config.session_storage, fc.session_storage);
     merge_opt!(config.extra_headers, fc.extra_headers);
     merge_opt!(config.user_agent, fc.user_agent);
+    merge_opt!(config.crux_api_token, fc.crux_api_token);
 
     if let Some(sc) = fc.scanner {
         merge_opt!(config.scanner.max_routes, sc.max_routes);
@@ -385,6 +392,7 @@ fn apply_cli_overrides(config: &mut Config, cli: CliOverrides) -> Result<()> {
     merge_opt!(config.ci.lhci_host, cli.lhci_host);
     merge_opt!(config.ci.lhci_build_token, cli.lhci_build_token);
     merge_opt!(config.ci.lhci_auth, cli.lhci_auth);
+    merge_opt!(config.crux_api_token, cli.crux_api_token);
 
     merge_parse!(config.scanner.device, cli.device, "Invalid device value in CLI");
     merge_parse!(config.ci.reporter, cli.reporter, "Invalid reporter value in CLI");

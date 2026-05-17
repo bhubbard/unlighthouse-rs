@@ -142,6 +142,12 @@ struct Cli {
     /// LHCI server basic auth token
     #[arg(long)]
     lhci_auth: Option<String>,
+
+    /// Google CrUX History API key (env: CRUX_API_TOKEN).
+    /// When set, CrUX data is fetched directly from the Google API rather
+    /// than being proxied through crux.unlighthouse.dev.
+    #[arg(long, env = "CRUX_API_TOKEN")]
+    crux_api_token: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -185,6 +191,7 @@ async fn main() -> Result<()> {
         lhci_host: cli.lhci_host.clone(),
         lhci_build_token: cli.lhci_build_token.clone(),
         lhci_auth: cli.lhci_auth.clone(),
+        crux_api_token: cli.crux_api_token.clone(),
     };
 
     let config = config::load_config(cli.config_file.as_ref(), overrides)

@@ -12,6 +12,183 @@ use crate::types::{ScanMeta, TaskStatus, WorkerStatus, WsEvent};
 
 use super::AppState;
 
+// ── CrUX types ────────────────────────────────────────────────────────────────
+
+/// Mirrors the CrUX History API response shape (only the fields we use).
+#[derive(serde::Deserialize)]
+struct CruxHistoryResponse {
+    record: CruxRecord,
+}
+
+#[derive(serde::Deserialize)]
+struct CruxRecord {
+    metrics: CruxMetrics,
+    #[serde(rename = "collectionPeriods")]
+    collection_periods: Vec<CollectionPeriod>,
+}
+
+#[derive(serde::Deserialize)]
+struct CruxMetrics {
+    #[serde(default)]
+    largest_contentful_paint: Option<CruxMetric>,
+    #[serde(default)]
+    cumulative_layout_shift: Option<CruxMetric>,
+    #[serde(default)]
+    interaction_to_next_paint: Option<CruxMetric>,
+}
+
+#[derive(serde::Deserialize)]
+struct CruxMetric {
+    #[serde(rename = "percentilesTimeseries")]
+    percentiles_timeseries: PercentilesTimeseries,
+}
+
+#[derive(serde::Deserialize)]
+struct PercentilesTimeseries {
+    p75s: Vec<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct CollectionPeriod {
+    #[serde(rename = "firstDate")]
+    first_date: CruxDate,
+}
+
+#[derive(serde::Deserialize)]
+struct CruxDate {
+    year: i32,
+    month: u32,
+    day: u32,
+}
+
+#[derive(serde::Serialize)]
+struct DataPoint {
+    value: f64,
+    time: i64,
+}
+
+/// Port of crux-api's `normaliseCruxHistory`. Produces `{ dates, cls, lcp, inp }`.
+fn normalise_crux_history(record: CruxRecord) -> serde_json::Value {
+    // Build timestamp array from collection periods (month is 1-based from the API).
+    let dates: Vec<i64> = record
+        .collection_periods
+        .iter()
+        .filter_map(|p| {
+            chrono::NaiveDate::from_ymd_opt(p.first_date.year, p.first_date.month, p.first_date.day)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+                .map(|dt| dt.and_utc().timestamp_millis())
+        })
+        .collect();
+
+    let parse_p75 = |metric: &Option<CruxMetric>| -> Vec<DataPoint> {
+        let p75s = match metric {
+            Some(m) => &m.percentiles_timeseries.p75s,
+            None => return vec![],
+        };
+        p75s.iter()
+            .enumerate()
+            .map(|(i, v)| DataPoint {
+                value: v.as_f64().unwrap_or(0.0),
+                time: dates.get(i).copied().unwrap_or(0),
+            })
+            .collect()
+    };
+
+    let cls = parse_p75(&record.metrics.cumulative_layout_shift);
+    let lcp = parse_p75(&record.metrics.largest_contentful_paint);
+    let inp = parse_p75(&record.metrics.interaction_to_next_paint);
+
+    // Find the first index where each series has a meaningful value.
+    let cls_start = cls.iter().position(|p| p.value >= 0.0);
+    let lcp_start = lcp.iter().position(|p| p.value > 0.0);
+    let inp_start = inp.iter().position(|p| p.value > 0.0);
+
+    let indexes: Vec<usize> = [cls_start, lcp_start, inp_start]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+
+    if indexes.is_empty() {
+        return serde_json::json!({ "dates": [], "cls": null, "lcp": null, "inp": null });
+    }
+
+    let start = *indexes.iter().min().unwrap();
+
+    // Find the last index that has a meaningful value in any series.
+    let cls_end = cls.iter().rposition(|p| p.value >= 0.0).unwrap_or(0);
+    let lcp_end = lcp.iter().rposition(|p| p.value > 0.0).unwrap_or(0);
+    let inp_end = inp.iter().rposition(|p| p.value > 0.0).unwrap_or(0);
+    let end = [cls_end, lcp_end, inp_end].iter().copied().max().unwrap_or(0);
+
+    // Guard against degenerate data that would cause a slice panic.
+    let end = end.min(dates.len());
+    if start >= end {
+        return serde_json::json!({ "dates": [], "cls": null, "lcp": null, "inp": null });
+    }
+
+    let sliced_dates: Vec<i64> = dates[start..end].to_vec();
+    let cls_out: Option<Vec<&DataPoint>> = cls_start.map(|_| cls[start..end.min(cls.len())].iter().collect());
+    let lcp_out: Option<Vec<&DataPoint>> = lcp_start.map(|_| lcp[start..end.min(lcp.len())].iter().collect());
+    let inp_out: Option<Vec<&DataPoint>> = inp_start.map(|_| inp[start..end.min(inp.len())].iter().collect());
+
+    serde_json::json!({
+        "dates": sliced_dates,
+        "cls":   cls_out,
+        "lcp":   lcp_out,
+        "inp":   inp_out,
+    })
+}
+
+/// Call the Google CrUX History API directly and return normalised JSON.
+async fn fetch_crux_direct(
+    client: &reqwest::Client,
+    token: &str,
+    origin: &str,
+) -> Result<serde_json::Value, String> {
+    let url = "https://chromeuxreport.googleapis.com/v1/records:queryHistoryRecord";
+    // Ensure origin has https scheme and trailing slash (mirrors crux-api's withHttps + withTrailingSlash).
+    let origin_url = if origin.starts_with("http://") || origin.starts_with("https://") {
+        format!("{}/", origin.trim_end_matches('/'))
+    } else {
+        format!("https://{}/", origin.trim_end_matches('/'))
+    };
+
+    let resp = client
+        .post(url)
+        .query(&[("key", token)])
+        .json(&serde_json::json!({ "origin": origin_url, "formFactor": "PHONE" }))
+        .send()
+        .await
+        .map_err(|e| format!("CrUX request failed: {e}"))?;
+
+    let status = resp.status();
+
+    // 404 → no data for this origin (not an error).
+    if status.as_u16() == 404 {
+        return Ok(serde_json::json!({ "exists": false }));
+    }
+
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("CrUX API error {status}: {body}"));
+    }
+
+    let crux: CruxHistoryResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("CrUX parse error: {e}"))?;
+
+    let normalised = normalise_crux_history(crux.record);
+
+    // If normalisation produced no dates, surface as { exists: false }.
+    if normalised["dates"].as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        return Ok(serde_json::json!({ "exists": false }));
+    }
+
+    Ok(normalised)
+}
+
 /// GET /api/reports — return all completed route reports
 pub async fn get_reports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let reports = state.route_reports.read().await;
@@ -110,17 +287,24 @@ pub async fn rescan_one(
     }
 }
 
-/// GET /api/crux/*site — proxy to crux.unlighthouse.dev
+/// GET /api/crux/*site — fetch CrUX history data.
+///
+/// When `config.crux_api_token` is set the Google CrUX History API is called
+/// directly and the result is normalised in Rust, eliminating the dependency on
+/// the external `crux.unlighthouse.dev` proxy service.
+///
+/// When no token is configured the handler falls back to proxying
+/// `crux.unlighthouse.dev` for backward compatibility.
 pub async fn get_crux_history(
     Path(site): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // Axum's wildcard matcher decodes percent encoding, so we get something like:
-    // "https:/www.calljacob.com/history" or "https://www.calljacob.com/history"
-    // Let's strip the "/history" suffix.
+    // Axum's wildcard matcher decodes percent encoding, so we may receive:
+    //   "https:/www.example.com/history" (single slash, double-slash collapsed)
+    // Strip the trailing "/history" segment first.
     let site = site.strip_suffix("/history").unwrap_or(&site).to_string();
 
-    // Reconstruct consecutive slashes if they were collapsed during routing/decoding
+    // Restore any double-slash that the router collapsed.
     let site = if site.starts_with("https:/") && !site.starts_with("https://") {
         site.replacen("https:/", "https://", 1)
     } else if site.starts_with("http:/") && !site.starts_with("http://") {
@@ -129,7 +313,32 @@ pub async fn get_crux_history(
         site
     };
 
-    // Percent-encode the site URL for the target API request
+    let empty_json = r#"{"exists":false}"#;
+
+    // ── Direct path: call Google CrUX API ────────────────────────────────────
+    if let Some(ref token) = state.config.crux_api_token {
+        info!("Fetching CrUX data directly for: {}", site);
+        return match fetch_crux_direct(&state.http_client, token, &site).await {
+            Ok(data) => {
+                let body = serde_json::to_string(&data).unwrap_or_else(|_| empty_json.to_string());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap()
+            }
+            Err(e) => {
+                tracing::warn!("CrUX direct fetch failed for {}: {}", site, e);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(empty_json))
+                    .unwrap()
+            }
+        };
+    }
+
+    // ── Fallback path: proxy to crux.unlighthouse.dev ─────────────────────────
     let encoded_site = urlencoding::encode(&site);
     let url = format!("https://crux.unlighthouse.dev/api/{}/crux/history", encoded_site);
     info!("Proxying CrUX request for: {} (encoded: {})", site, encoded_site);
@@ -141,11 +350,14 @@ pub async fn get_crux_history(
                 let body = resp.bytes().await.unwrap_or_default();
                 (status, body).into_response()
             } else {
-                info!("CrUX proxy returned non-success code {} for site: {}. Gracefully returning empty crux data JSON.", status, site);
+                info!(
+                    "CrUX proxy returned {} for: {}. Returning empty data.",
+                    status, site
+                );
                 Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"exists":false}"#))
+                    .body(Body::from(empty_json))
                     .unwrap()
             }
         }
@@ -154,7 +366,7 @@ pub async fn get_crux_history(
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"exists":false}"#))
+                .body(Body::from(empty_json))
                 .unwrap()
         }
     }
