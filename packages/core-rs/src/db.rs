@@ -119,10 +119,18 @@ pub async fn open(db_path: &str) -> Result<SqlitePool> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+    use std::str::FromStr;
+
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path))?
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_millis(5000))
+        .create_if_missing(true);
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        // `mode=rwc` — create the file if it does not yet exist.
-        .connect(&format!("sqlite://{}?mode=rwc&_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000", db_path))
+        .connect_with(opts)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to open SQLite DB at {db_path}: {e}"))?;
 
