@@ -1,6 +1,6 @@
 <script lang="ts" setup>
 import type { UnlighthouseColumn, UnlighthouseRouteReport } from '@unlighthouse/core'
-import { activeTab, openLighthouseReportIframeModal, throttle, website } from '../../logic'
+import { activeTab, categories, openLighthouseReportIframeModal, throttle, website } from '../../logic'
 
 const props = defineProps<{
   report: UnlighthouseRouteReport
@@ -12,8 +12,7 @@ const categoryKey = computed(() => {
     return null
 
   const tab = activeTab.value - 1
-  const keys = Object.keys(props.report.report.categories)
-  return keys[tab]
+  return categories[tab]
 })
 const category = computed(() => {
   if (!categoryKey.value)

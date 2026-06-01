@@ -160,8 +160,12 @@ struct Cli {
     pub async fn run() -> Result<()> {
         let cli = Cli::parse();
 
-    // Set up tracing
-    let log_level = if cli.debug { "debug" } else { "info" };
+    // Set up tracing. Silence html5ever's noisy HTML parsing warnings by default.
+    let log_level = if cli.debug {
+        "debug,html5ever=error"
+    } else {
+        "info,html5ever=error"
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -200,7 +204,7 @@ struct Cli {
         purge_runs_older_than_days: cli.purge_runs_older_than_days,
     };
 
-    let config = unlighthouse_rs::config::load_config(cli.config_file.as_ref(), overrides)
+    let mut config = unlighthouse_rs::config::load_config(cli.config_file.as_ref(), overrides)
         .context("Failed to load configuration")?;
 
     if config.site.is_empty() {
@@ -209,17 +213,44 @@ struct Cli {
 
     // If running in normal server mode, bind to the port early to fail fast
     // if the address is already in use, preventing unnecessary heavy initialization.
+    // Try up to 10 fallback ports if the primary port is busy.
     let listener = if !config.ci.enabled && !cli.mcp {
-        let addr = tokio::net::lookup_host(format!("{}:{}", config.host, config.port))
-            .await
-            .context("Failed to resolve host")?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No address found for {}:{}", config.host, config.port))?;
-
-        let l = tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("Failed to bind to address {addr}"))?;
-        Some(l)
+        let mut port = config.port;
+        let mut listener = None;
+        let max_port = port + 10;
+        
+        while port <= max_port {
+            match tokio::net::lookup_host((config.host.as_str(), port)).await {
+                Ok(mut addrs) => {
+                    if let Some(addr) = addrs.next() {
+                        match tokio::net::TcpListener::bind(addr).await {
+                            Ok(l) => {
+                                let actual_port = l.local_addr().map(|a| a.port()).unwrap_or(port);
+                                if actual_port != config.port {
+                                    info!("Port {} was busy, automatically bound to fallback port {}", config.port, actual_port);
+                                    config.port = actual_port;
+                                }
+                                listener = Some(l);
+                                break;
+                            }
+                            Err(e) => {
+                                if port == max_port {
+                                    anyhow::bail!("Failed to bind to address {}:{}: {}", config.host, port, e);
+                                }
+                                warn!("Port {port} is busy, trying fallback port {}...", port + 1);
+                                port += 1;
+                            }
+                        }
+                    } else {
+                        anyhow::bail!("No address found for {}:{}", config.host, port);
+                    }
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to resolve host {}:{}: {}", config.host, port, e);
+                }
+            }
+        }
+        listener
     } else {
         None
     };

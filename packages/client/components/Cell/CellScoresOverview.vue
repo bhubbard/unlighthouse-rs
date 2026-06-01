@@ -17,8 +17,12 @@ defineProps<{
     @click="openLighthouseReportIframeModal(report)"
   >
     <div class="grid gap-2 flex" :class="[`grid-cols-${categories.length}`]">
-      <div v-for="(val, ck) in report.report.categories" :key="ck">
-        <metric-guage :score="val.score" :label="val.title" />
+      <div v-for="c in categories" :key="c">
+        <metric-guage
+          v-if="report.report.categories[c]"
+          :score="report.report.categories[c].score"
+          :label="report.report.categories[c].title"
+        />
       </div>
     </div>
     <div class="text-xs opacity-80 mt-2 text-left flex items-center gap-1">

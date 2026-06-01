@@ -199,36 +199,28 @@ export default defineComponent({
     }
     return {
       ui: {
-        wrapper: 'flex items-center -space-x-px',
+        wrapper: 'flex items-center space-x-1',
         base: '',
-        rounded: 'first:rounded-s-md last:rounded-e-md',
+        rounded: '',
         default: {
           size: 'sm',
           activeButton: {
-            class: 'text-teal-900 dark:text-teal-100 font-bold! underline',
+            class: 'px-3 py-1 bg-teal-600 dark:bg-teal-500 text-white border border-teal-600 dark:border-teal-500 rounded-md font-bold text-xs shadow-sm shadow-teal-500/20 cursor-default pointer-events-none',
           },
           inactiveButton: {
-            color: 'bg-white text-teal-100',
+            class: 'px-3 py-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/80 transition-all duration-200 text-xs font-semibold shadow-sm',
           },
           firstButton: {
-            color: 'white',
-            class: 'rtl:[&_span:first-child]:rotate-180',
-            icon: 'i-heroicons-chevron-double-left-20-solid',
+            class: 'px-2 py-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/80 disabled:opacity-40 disabled:pointer-events-none transition-all duration-200 flex items-center justify-center shadow-sm',
           },
           lastButton: {
-            color: 'white',
-            class: 'rtl:[&_span:last-child]:rotate-180',
-            icon: 'i-heroicons-chevron-double-right-20-solid',
+            class: 'px-2 py-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/80 disabled:opacity-40 disabled:pointer-events-none transition-all duration-200 flex items-center justify-center shadow-sm',
           },
           prevButton: {
-            color: 'white',
-            class: 'rtl:[&_span:first-child]:rotate-180',
-            icon: 'i-heroicons-chevron-left-20-solid',
+            class: 'px-2 py-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/80 disabled:opacity-40 disabled:pointer-events-none transition-all duration-200 flex items-center justify-center shadow-sm',
           },
           nextButton: {
-            color: 'white',
-            class: 'rtl:[&_span:last-child]:rotate-180',
-            icon: 'i-heroicons-chevron-right-20-solid',
+            class: 'px-2 py-1 border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/80 disabled:opacity-40 disabled:pointer-events-none transition-all duration-200 flex items-center justify-center shadow-sm',
           },
         },
       },
@@ -275,16 +267,20 @@ export default defineComponent({
       </BtnBasic>
     </slot>
 
-    <BtnBasic
-      v-for="(page, index) of displayedPages"
-      :key="`${page}-${index}`"
-      :disabled="disabled"
-      v-bind="page === currentPage ? { ...(ui.default.activeButton || {}), ...activeButton } : { ...(ui.default.inactiveButton || {}), ...inactiveButton }"
-      :class="[{ 'pointer-events-none': typeof page === 'string', 'z-1': page === currentPage }, ui.base, ui.rounded]"
-      @click="() => onClickPage(page)"
-    >
-      {{ page }}
-    </BtnBasic>
+    <template v-for="(page, index) of displayedPages" :key="`${page}-${index}`">
+      <span v-if="typeof page === 'string'" class="px-2.5 py-1 text-gray-400 dark:text-gray-500 text-xs font-semibold select-none flex items-center justify-center">
+        {{ page }}
+      </span>
+      <BtnBasic
+        v-else
+        :disabled="disabled"
+        v-bind="page === currentPage ? { ...(ui.default.activeButton || {}), ...activeButton } : { ...(ui.default.inactiveButton || {}), ...inactiveButton }"
+        :class="[{ 'z-1': page === currentPage }, ui.base, ui.rounded]"
+        @click="() => onClickPage(page)"
+      >
+        {{ page }}
+      </BtnBasic>
+    </template>
 
     <slot name="next" :on-click="onClickNext">
       <BtnBasic

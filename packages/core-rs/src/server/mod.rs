@@ -213,7 +213,7 @@ async fn index_handler(State(state): State<Arc<AppState>>) -> Response {
         .header("Cross-Origin-Opener-Policy", "same-origin")
         .header("X-Frame-Options", "SAMEORIGIN")
         .header("X-Content-Type-Options", "nosniff")
-        .header(header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss: https://api.iconify.design; object-src 'none'; frame-ancestors 'self';")
+        .header(header::CONTENT_SECURITY_POLICY, "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* https://api.iconify.design; object-src 'none'; frame-ancestors 'self';")
         .body(Body::from(injected))
         .unwrap()
 }
@@ -280,7 +280,7 @@ async fn add_security_headers(req: axum::extract::Request, next: axum::middlewar
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss: https://api.iconify.design; object-src 'none'; frame-ancestors 'self';"),
+        header::HeaderValue::from_static("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* https://api.iconify.design; object-src 'none'; frame-ancestors 'self';"),
     );
 
     // Add Cache-Control for static assets

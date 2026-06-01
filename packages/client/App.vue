@@ -101,6 +101,17 @@ const _appName = (window as any).__unlighthouse_payload?.appName ?? 'Unlighthous
 useTitle(`${website.replace(/https?:\/\/(www.)?/, '')} | ${_appName}`)
 
 const tabListEl = ref<HTMLElement | null>(null)
+
+function setActiveTab(key: number) {
+  if (typeof document !== 'undefined' && (document as any).startViewTransition) {
+    (document as any).startViewTransition(() => {
+      store.activeTab = key
+    })
+  } else {
+    store.activeTab = key
+  }
+}
+
 function onTabKeydown(e: KeyboardEvent, key: number) {
   const count = filteredTabs.value.length
   let next = key
@@ -115,7 +126,7 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
   else
     return
   e.preventDefault()
-  store.activeTab = next
+  setActiveTab(next)
   nextTick(() => {
     tabListEl.value?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[next]?.focus()
   })
@@ -137,21 +148,35 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
                 :aria-selected="store.activeTab === key"
                 :tabindex="store.activeTab === key ? 0 : -1"
                 :selected="store.activeTab === key"
-                @click="store.activeTab = key"
+                @click="setActiveTab(key)"
                 @keydown="onTabKeydown($event, key)"
+                class="flex-col !items-stretch !justify-center !space-x-0 w-full px-3 py-2"
               >
-                <span class="inline-flex items-center space-x-1">
-                  <UIcon :name="category.icon" class="inline text-sm opacity-40 h-4 w-4" />
-                  <span>{{ category.label }}</span>
-                  <tooltip v-if="category.label === 'Performance'" class="text-left">
-                    <UIcon name="i-carbon-warning" class="inline text-xs mx-1" />
-                    <template #tooltip>
-                      <div class="mb-2">Lighthouse is running with variability. Performance scores should not be considered accurate.</div>
-                      <div>Unlighthouse is running <span class="underline">with{{ throttle ? '' : 'out' }} throttling</span> which will also effect scores.</div>
-                    </template>
-                  </tooltip>
-                </span>
-                <metric-guage v-if="shouldShowCategoryScore(category, key)" :score="store.categoryScores[key - 1]" :stripped="true" class="dark:font-bold" :class="store.activeTab === key ? ['dark:bg-teal-900 bg-blue-100 rounded px-2'] : []" />
+                <div class="flex items-start justify-between w-full">
+                  <span class="inline-flex items-center space-x-1 mt-0.5">
+                    <UIcon :name="category.icon" class="inline text-sm opacity-40 h-4 w-4" />
+                    <span>{{ category.label }}</span>
+                    <tooltip v-if="category.label === 'Performance'" class="text-left">
+                      <UIcon name="i-carbon-warning" class="inline text-xs mx-1" />
+                      <template #tooltip>
+                        <div class="mb-2">Lighthouse is running with variability. Performance scores should not be considered accurate.</div>
+                        <div>Unlighthouse is running <span class="underline">with{{ throttle ? '' : 'out' }} throttling</span> which will also effect scores.</div>
+                      </template>
+                    </tooltip>
+                  </span>
+                  <div v-if="shouldShowCategoryScore(category, key)" class="flex flex-col items-end">
+                    <metric-guage :score="store.categoryScores[key - 1]" :stripped="true" class="dark:font-bold" :class="store.activeTab === key ? ['dark:bg-teal-900 bg-blue-100 rounded px-2'] : []" />
+                    <div
+                      v-if="store.categoryScoreStats?.[category.label.toLowerCase().replace(/\s+/g, '-')]"
+                      class="flex flex-col items-end text-[9px] opacity-60 mt-1 font-mono tracking-tight leading-normal"
+                      :class="store.activeTab === key ? 'text-blue-200' : 'text-blue-900/60 dark:text-blue-200/60'"
+                    >
+                      <span>min: {{ store.categoryScoreStats[category.label.toLowerCase().replace(/\s+/g, '-')].min }}</span>
+                      <span>max: {{ store.categoryScoreStats[category.label.toLowerCase().replace(/\s+/g, '-')].max }}</span>
+                      <span>med: {{ store.categoryScoreStats[category.label.toLowerCase().replace(/\s+/g, '-')].median }}</span>
+                    </div>
+                  </div>
+                </div>
               </btn-tab>
             </div>
             <div v-if="store.scanMeta?.dynamicSampling" class="text-sm opacity-70 mt-3">
@@ -179,7 +204,7 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
             </div>
           </div>
         </div>
-        <div class="xl:w-full px-3 mr-5">
+        <div class="xl:w-full px-3 mr-5" style="view-transition-name: main-content;">
           <div v-if="filteredTabs[store.activeTab]?.label === 'CrUX'">
             <div>
               <h2 class="font-bold text-2xl mb-7">
@@ -214,93 +239,107 @@ function onTabKeydown(e: KeyboardEvent, key: number) {
             </div>
           </div>
           <template v-else-if="!store.shouldShowWaitingState">
-            <div class="pr-10 pb-1 w-full min-w-[1500px]">
-              <div class="grid grid-cols-12 gap-4 text-sm dark:text-gray-300 text-gray-700">
-                <results-table-head
-                  v-for="(column, key) in store.resultColumns"
-                  :key="key"
-                  :sorting="store.sorting"
-                  :column="column"
-                  @sort="store.incrementSort"
-                />
+            <!-- Scrollable Table Container -->
+            <div class="w-full overflow-x-auto pb-4">
+              <div class="min-w-[1500px]">
+                <!-- Table Header -->
+                <div class="pr-10 pb-1 w-full">
+                  <div class="grid grid-cols-12 gap-4 text-sm dark:text-gray-300 text-gray-700">
+                    <results-table-head
+                      v-for="(column, key) in store.resultColumns"
+                      :key="key"
+                      :sorting="store.sorting"
+                      :column="column"
+                      @sort="store.incrementSort"
+                    />
+                  </div>
+                </div>
+                <!-- Table Body -->
+                <div class="w-full pr-3 overflow-y-auto xl:max-h-[calc(100vh-160px)] lg:max-h-[calc(100vh-265px)] sm:max-h-[calc(100vh-280px)] max-h-[calc(100vh-310px)]">
+                  <div v-if="Object.values(store.searchResults).length === 0" class="px-4 py-3">
+                    <template v-if="store.searchText">
+                      <p class="mb-2">
+                        No results for search "{{ store.searchText }}"...
+                      </p>
+                      <btn-action class="dark:bg-teal-700 bg-blue-100 px-2 text-sm" @click="store.searchText = ''">
+                        Reset Search
+                      </btn-action>
+                    </template>
+                    <template v-else-if="store.isOffline && !isStatic">
+                      <div class="flex items-center space-x-3 p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
+                        <UIcon name="i-carbon-warning-alt" class="text-yellow-600 dark:text-yellow-400 text-xl" />
+                        <div>
+                          <p class="font-medium text-yellow-800 dark:text-yellow-200">
+                            Server Connection Lost
+                          </p>
+                          <p class="text-sm text-yellow-700 dark:text-yellow-300 mt-1">
+                            The Unlighthouse client is running but cannot connect to the server.
+                            Please ensure the Unlighthouse server is running and accessible.
+                          </p>
+                        </div>
+                      </div>
+                    </template>
+                    <template v-else-if="isStatic && (!window.__unlighthouse_payload?.reports || window.__unlighthouse_payload.reports.length === 0)">
+                      <div class="flex items-center space-x-3 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
+                        <UIcon name="i-carbon-information" class="text-blue-600 dark:text-blue-400 text-xl" />
+                        <div>
+                          <p class="font-medium text-blue-800 dark:text-blue-200">
+                            No Report Data
+                          </p>
+                          <p class="text-sm text-blue-700 dark:text-blue-300 mt-1">
+                            This is a static client build with no report data.
+                            Generate reports using the Unlighthouse CLI to see lighthouse results here.
+                          </p>
+                        </div>
+                      </div>
+                    </template>
+                    <div v-else class="flex items-center">
+                      <loading-spinner class="mr-2" aria-label="Loading" />
+                      <div>
+                        <p aria-live="polite">
+                          Waiting for routes...
+                        </p>
+                        <span class="text-xs opacity-50">If this hangs consider running Unlighthouse with --debug.</span>
+                      </div>
+                    </div>
+                  </div>
+                  <div v-else-if="store.searchText" class="px-4 py-3">
+                    <p id="search-results-status" aria-live="polite">
+                      Showing {{ Object.values(store.searchResults).flat().length }} routes for search "{{ store.searchText }}":
+                    </p>
+                  </div>
+                  <results-route
+                    v-for="(report, routeName) in store.paginatedResults"
+                    :key="routeName"
+                    v-memo="[report.route.url, report.report?.categories, report.tasks.runLighthouseTask]"
+                    :report="report"
+                  >
+                    <template #actions>
+                      <UDropdownMenu :items="getDropdownActions(report)" :content="{ placement: 'left' }">
+                        <UButton
+                          icon="i-heroicons-ellipsis-vertical"
+                          size="sm"
+                          color="neutral"
+                          variant="ghost"
+                          aria-label="Open actions menu"
+                        />
+                      </UDropdownMenu>
+                    </template>
+                  </results-route>
+                </div>
               </div>
             </div>
-            <div class="w-full min-w-[1500px] pr-3 overflow-y-auto xl:max-h-[calc(100vh-100px)] lg:max-h-[calc(100vh-205px)] sm:max-h-[calc(100vh-220px)] max-h-[calc(100vh-250px)]">
-              <div v-if="Object.values(store.searchResults).length === 0" class="px-4 py-3">
-                <template v-if="store.searchText">
-                  <p class="mb-2">
-                    No results for search "{{ store.searchText }}"...
-                  </p>
-                  <btn-action class="dark:bg-teal-700 bg-blue-100 px-2 text-sm" @click="store.searchText = ''">
-                    Reset Search
-                  </btn-action>
-                </template>
-                <template v-else-if="store.isOffline && !isStatic">
-                  <div class="flex items-center space-x-3 p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg border border-yellow-200 dark:border-yellow-800">
-                    <UIcon name="i-carbon-warning-alt" class="text-yellow-600 dark:text-yellow-400 text-xl" />
-                    <div>
-                      <p class="font-medium text-yellow-800 dark:text-yellow-200">
-                        Server Connection Lost
-                      </p>
-                      <p class="text-sm text-yellow-700 dark:text-yellow-300 mt-1">
-                        The Unlighthouse client is running but cannot connect to the server.
-                        Please ensure the Unlighthouse server is running and accessible.
-                      </p>
-                    </div>
-                  </div>
-                </template>
-                <template v-else-if="isStatic && (!window.__unlighthouse_payload?.reports || window.__unlighthouse_payload.reports.length === 0)">
-                  <div class="flex items-center space-x-3 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
-                    <UIcon name="i-carbon-information" class="text-blue-600 dark:text-blue-400 text-xl" />
-                    <div>
-                      <p class="font-medium text-blue-800 dark:text-blue-200">
-                        No Report Data
-                      </p>
-                      <p class="text-sm text-blue-700 dark:text-blue-300 mt-1">
-                        This is a static client build with no report data.
-                        Generate reports using the Unlighthouse CLI to see lighthouse results here.
-                      </p>
-                    </div>
-                  </div>
-                </template>
-                <div v-else class="flex items-center">
-                  <loading-spinner class="mr-2" aria-label="Loading" />
-                  <div>
-                    <p aria-live="polite">
-                      Waiting for routes...
-                    </p>
-                    <span class="text-xs opacity-50">If this hangs consider running Unlighthouse with --debug.</span>
-                  </div>
-                </div>
-              </div>
-              <div v-else-if="store.searchText" class="px-4 py-3">
-                <p id="search-results-status" aria-live="polite">
-                  Showing {{ Object.values(store.searchResults).flat().length }} routes for search "{{ store.searchText }}":
-                </p>
-              </div>
-              <results-route
-                v-for="(report, routeName) in store.paginatedResults"
-                :key="routeName"
-                v-memo="[report.route.url, report.report?.categories, report.tasks.runLighthouseTask]"
-                :report="report"
-              >
-                <template #actions>
-                  <UDropdownMenu :items="getDropdownActions(report)" :content="{ placement: 'left' }">
-                    <UButton
-                      icon="i-heroicons-ellipsis-vertical"
-                      size="sm"
-                      color="neutral"
-                      variant="ghost"
-                      aria-label="Open actions menu"
-                    />
-                  </UDropdownMenu>
-                </template>
-              </results-route>
-              <div v-if="store.searchResults.length > store.perPage" class="flex items-center space-x-4 mt-5">
+
+            <!-- Sticky/Persistent Pagination Footer Panel -->
+            <div v-if="store.searchResults.length > store.perPage" class="flex flex-col sm:flex-row items-center justify-between gap-4 mt-2 border-t border-gray-100 dark:border-gray-800/80 pt-4 w-full px-1">
+              <div class="flex items-center space-x-4">
                 <Pagination v-model="store.page" :page-count="store.perPage" :total="store.searchResults.length" />
-                <div class="opacity-70">
-                  {{ store.searchResults.length }} total
+                <div class="opacity-70 text-xs font-semibold font-mono text-gray-500 dark:text-gray-400">
+                  {{ store.searchResults.length }} total routes
                 </div>
+              </div>
+              <div class="hidden sm:block text-xs font-mono text-gray-400 dark:text-gray-500">
+                Page {{ store.page }} of {{ Math.ceil(store.searchResults.length / store.perPage) }}
               </div>
             </div>
           </template>

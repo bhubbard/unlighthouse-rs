@@ -189,7 +189,9 @@ export async function wsConnect() {
     const ws = new WebSocket(wsUrl)
     ws.onmessage = (message) => {
       try {
-        const { response } = JSON.parse(message.data)
+        const parsed = JSON.parse(message.data)
+        // Handle both legacy "response" payload format and standard WsEvent "data" format
+        const response = parsed.response || parsed.data
         if (response?.route?.path) {
           wsReports.set(response.route.path, response)
         }
@@ -240,7 +242,7 @@ export const categoryScores = computed(() => {
   return categories.map((c, i) => {
     const reportsWithGoodScore = reportsFinished
     // make sure the score is valid, if it's ? we don't want to count it
-      .filter(r => !!r.report?.categories?.[i]?.score)
+      .filter(r => !!r.report?.categories?.[c]?.score)
 
     if (reportsWithGoodScore.length === 0) {
       return 0
@@ -248,7 +250,42 @@ export const categoryScores = computed(() => {
 
     return reportsWithGoodScore
       // make sure the score is valid, if it's ? we don't want to count it
-      .map(r => r.report?.categories?.[i]?.score || 0)
+      .map(r => r.report?.categories?.[c]?.score || 0)
       .reduce((a, b) => a + b, 0) / reportsWithGoodScore.length
   })
 })
+
+export const categoryScoreStats = computed(() => {
+  const reports = unlighthouseReports.value || []
+  const reportsFinished = reports.filter(r => !!r.report)
+
+  const statsMap: Record<string, { min: number; max: number; median: number } | null> = {}
+
+  categories.forEach((c) => {
+    const reportsWithGoodScore = reportsFinished.filter((r) => {
+      const val = r.report?.categories?.[c]?.score
+      return typeof val === 'number' && !isNaN(val)
+    })
+
+    if (reportsWithGoodScore.length === 0) {
+      statsMap[c] = null
+      return
+    }
+
+    const scores = reportsWithGoodScore.map(r => Math.round((r.report?.categories?.[c]?.score || 0) * 100))
+    const sorted = [...scores].sort((a, b) => a - b)
+    const mid = Math.floor(sorted.length / 2)
+    const median = sorted.length % 2 !== 0
+      ? sorted[mid]
+      : Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+
+    statsMap[c] = {
+      min: Math.min(...scores),
+      max: Math.max(...scores),
+      median,
+    }
+  })
+
+  return statsMap
+})
+
