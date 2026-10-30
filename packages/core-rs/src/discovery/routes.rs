@@ -272,3 +272,123 @@ fn glob_match(pattern: &str, s: &str) -> bool {
         .map(|p| p.matches(s))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalise_route_relative_and_absolute() {
+        let r1 = normalise_route("/about", "https://example.com/");
+        assert_eq!(r1.path, "/about");
+        assert_eq!(r1.url, "https://example.com/about");
+        assert_eq!(r1.definition.name, "/about");
+
+        let r2 = normalise_route("https://example.com/pricing?plan=pro", "https://example.com");
+        assert_eq!(r2.path, "/pricing");
+        assert_eq!(r2.url, "https://example.com/pricing?plan=pro");
+    }
+
+    #[test]
+    fn test_passes_filters_prefix_glob_and_regex() {
+        // Plain prefix & glob
+        let include = vec!["/blog".to_string(), "/products/*".to_string()];
+        let exclude = vec!["/blog/draft-*".to_string(), "/^\\/products\\/secret-\\d+$/".to_string()];
+
+        assert!(passes_filters("/blog/post-1", &include, &exclude));
+        assert!(!passes_filters("/blog/draft-1", &include, &exclude));
+        assert!(passes_filters("/products/shoes", &include, &exclude));
+        assert!(!passes_filters("/products/secret-42", &include, &exclude));
+        assert!(!passes_filters("/about", &include, &exclude));
+
+        // Caret regex pattern
+        let re_inc = vec!["^/docs/(v1|v2)/".to_string()];
+        assert!(passes_filters("/docs/v1/intro", &re_inc, &[]));
+        assert!(!passes_filters("/docs/v3/intro", &re_inc, &[]));
+    }
+
+    #[test]
+    fn test_path_group_key_dynamic_vs_static() {
+        assert_eq!(path_group_key("/"), "/");
+        assert_eq!(path_group_key("/about"), "/about");
+        // Second segment is numeric/dashes > 4 chars -> grouped by first segment
+        assert_eq!(path_group_key("/blog/2026-10-30"), "/blog");
+        assert_eq!(path_group_key("/orders/987654"), "/orders");
+        // Second segment is static word -> uses first two segments
+        assert_eq!(path_group_key("/docs/getting-started/install"), "/docs/getting-started");
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn test_crawl_page_and_resolve_reportable_routes() {
+        use axum::{extract::State, routing::get, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let site = format!("http://{addr}");
+
+        let app = Router::new()
+            .route(
+                "/robots.txt",
+                get(|State(site): State<String>| async move {
+                    format!("User-agent: *\nDisallow: /admin\nSitemap: {site}/sitemap.xml\n")
+                }),
+            )
+            .route(
+                "/sitemap.xml",
+                get(|State(site): State<String>| async move {
+                    format!(
+                        r#"<urlset>
+                            <url><loc>{site}/</loc></url>
+                            <url><loc>{site}/about</loc></url>
+                            <url><loc>{site}/admin/panel</loc></url>
+                            <url><loc>{site}/blog/2026-01</loc></url>
+                            <url><loc>{site}/blog/2026-02</loc></url>
+                            <url><loc>{site}/blog/2026-03</loc></url>
+                            <url><loc>{site}/assets/app.js</loc></url>
+                        </urlset>"#
+                    )
+                }),
+            )
+            .route(
+                "/",
+                get(|| async {
+                    r#"<html><body>
+                        <a href="/contact">Contact</a>
+                        <a href="/bundle.css">CSS</a>
+                        <a href="https://external.org/out">Out</a>
+                    </body></html>"#
+                }),
+            )
+            .with_state(site.clone());
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = Config {
+            site: site.clone(),
+            ..Default::default()
+        };
+        config.scanner.dynamic_sampling = Some(2);
+
+        let (routes, client, robots_rules) = resolve_reportable_routes(&config).await.unwrap();
+        assert_eq!(robots_rules.len(), 1);
+
+        let paths: Vec<&str> = routes.iter().map(|r| r.path.as_str()).collect();
+        // /admin/panel disallowed by robots.txt; /assets/app.js excluded as non-HTML;
+        // /blog/* capped at 2 by dynamic_sampling=2
+        assert!(paths.contains(&"/"));
+        assert!(paths.contains(&"/about"));
+        assert!(!paths.contains(&"/admin/panel"));
+        assert!(!paths.contains(&"/assets/app.js"));
+        let blog_count = paths.iter().filter(|p| p.starts_with("/blog/")).count();
+        assert_eq!(blog_count, 2);
+
+        // Also verify crawl_page extracts only internal HTML links
+        let crawled = crawl_page(&client, &format!("{site}/"), &site)
+            .await
+            .unwrap();
+        assert_eq!(crawled, vec![format!("{site}/contact")]);
+    }
+}

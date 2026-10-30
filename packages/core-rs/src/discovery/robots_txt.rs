@@ -38,7 +38,7 @@ pub fn parse_robots_txt(content: &str) -> ParsedRobotsTxt {
                        disallow: &mut Vec<String>,
                        _host: &mut Option<String>,
                        groups: &mut Vec<RobotsGroup>| {
-        let disallow_filtered: Vec<String> = disallow.iter().cloned().collect();
+        let disallow_filtered: Vec<String> = disallow.to_vec();
         let allow_filtered: Vec<String> = allow.iter().filter(|r| !r.is_empty()).cloned().collect();
 
         let mut rules: Vec<RobotsRule> = Vec::new();

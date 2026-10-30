@@ -21,15 +21,14 @@ native = [
   "dep:tower",
   "dep:tower-http",
   "dep:headless_chrome",
-  "dep:chromiumoxide",
   "dep:num_cpus",
   "dep:rust-embed",
   "dep:mime_guess",
-  "dep:image",
   "dep:base64",
   "dep:chrono",
   "dep:sqlx"
 ]
+chromiumoxide-backend = [ "dep:chromiumoxide" ]
 
 [dependencies]
 # Async runtime (only needed for native target runtime)
@@ -127,8 +126,16 @@ futures = "0.3"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
-# Image processing
-image = { version = "0.25", optional = true }
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
 
 [profile.release]
 opt-level = 3

@@ -343,3 +343,251 @@ pub async fn get_route_trend(
     .await?;
     Ok(rows)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, SeoData,
+        TaskMap, TaskStatus, WebVitalsSnapshot,
+    };
+    use std::collections::HashMap;
+
+    fn sample_route_report(
+        id: &str,
+        path: &str,
+        url: &str,
+        lh: Option<LighthouseReport>,
+        vitals: Option<WebVitalsSnapshot>,
+        status_code: Option<u16>,
+    ) -> RouteReport {
+        RouteReport {
+            report_id: id.to_string(),
+            route: NormalisedRoute {
+                id: id.to_string(),
+                path: path.to_string(),
+                url: url.to_string(),
+                definition: RouteDefinition {
+                    name: path.to_string(),
+                    path: path.to_string(),
+                },
+            },
+            artifact_path: format!("/tmp/{id}"),
+            artifact_url: format!("/{id}/"),
+            tasks: TaskMap {
+                inspect_html_task: TaskStatus::Completed,
+                run_lighthouse_task: TaskStatus::Completed,
+            },
+            report: lh,
+            seo: Some(SeoData {
+                status_code,
+                ..Default::default()
+            }),
+            web_vitals: vitals,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_db_open_insert_finish_and_list_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let pool = open(db_path.to_str().unwrap()).await.unwrap();
+
+        insert_run(&pool, "run-1", "https://a.example.com", "full")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        insert_run(&pool, "run-2", "https://a.example.com", "fast")
+            .await
+            .unwrap();
+        insert_run(&pool, "run-other", "https://b.example.com", "full")
+            .await
+            .unwrap();
+
+        finish_run(&pool, "run-1", 12).await.unwrap();
+
+        let runs_a = list_runs(&pool, "https://a.example.com", 10).await.unwrap();
+        assert_eq!(runs_a.len(), 2);
+        // Newest first
+        assert_eq!(runs_a[0].id, "run-2");
+        assert_eq!(runs_a[0].mode, "fast");
+        assert!(runs_a[0].finished_at.is_none());
+
+        assert_eq!(runs_a[1].id, "run-1");
+        assert_eq!(runs_a[1].route_count, Some(12));
+        assert!(runs_a[1].finished_at.is_some());
+
+        // Limit parameter works
+        let limited = list_runs(&pool, "https://a.example.com", 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "run-2");
+    }
+
+    #[tokio::test]
+    async fn test_db_insert_and_get_route_scores_full_and_fast() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("scores.db");
+        let pool = open(db_path.to_str().unwrap()).await.unwrap();
+
+        insert_run(&pool, "run-full", "https://example.com", "full")
+            .await
+            .unwrap();
+
+        let mut cats = HashMap::new();
+        cats.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.91),
+                title: None,
+                key: None,
+            },
+        );
+        cats.insert(
+            "accessibility".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.98),
+                title: None,
+                key: None,
+            },
+        );
+        cats.insert(
+            "best-practices".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.95),
+                title: None,
+                key: None,
+            },
+        );
+        cats.insert(
+            "seo".to_string(),
+            LighthouseCategoryScore {
+                score: Some(1.0),
+                title: None,
+                key: None,
+            },
+        );
+
+        let lh_rep = LighthouseReport {
+            score: 0.96,
+            categories: cats,
+            audits: serde_json::Value::Null,
+        };
+        let rep_home = sample_route_report(
+            "r1",
+            "/zeta",
+            "https://example.com/zeta",
+            Some(lh_rep),
+            None,
+            Some(200),
+        );
+        let rep_fast = sample_route_report(
+            "r2",
+            "/alpha",
+            "https://example.com/alpha",
+            None,
+            Some(WebVitalsSnapshot {
+                fcp: Some(850.0),
+                lcp: Some(1400.0),
+                cls: Some(0.02),
+                ttfb: Some(180.0),
+                tbt: Some(45.0),
+                score: 0.99,
+            }),
+            Some(301),
+        );
+
+        insert_route_score(&pool, "run-full", &rep_home)
+            .await
+            .unwrap();
+        insert_route_score(&pool, "run-full", &rep_fast)
+            .await
+            .unwrap();
+
+        let scores = get_run_scores(&pool, "run-full").await.unwrap();
+        assert_eq!(scores.len(), 2);
+        // Sorted by path ASC: /alpha first, then /zeta
+        assert_eq!(scores[0].path, "/alpha");
+        assert!((scores[0].score.unwrap() - 0.99).abs() < 1e-6);
+        assert_eq!(scores[0].lcp, Some(1400.0));
+        assert_eq!(scores[0].cls, Some(0.02));
+        assert_eq!(scores[0].status_code, Some(301));
+
+        assert_eq!(scores[1].path, "/zeta");
+        assert!((scores[1].score.unwrap() - 0.96).abs() < 1e-6);
+        assert!((scores[1].performance.unwrap() - 0.91).abs() < 1e-6);
+        assert!((scores[1].accessibility.unwrap() - 0.98).abs() < 1e-6);
+        assert!((scores[1].best_practices.unwrap() - 0.95).abs() < 1e-6);
+        assert!((scores[1].seo_score.unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(scores[1].status_code, Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_db_route_trend_and_purge_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("trend.db");
+        let pool = open(db_path.to_str().unwrap()).await.unwrap();
+
+        insert_run(&pool, "run-old", "https://example.com", "fast")
+            .await
+            .unwrap();
+        // Backdate run-old by 45 days
+        let old_ts = chrono::Utc::now().timestamp_millis() - (45 * 24 * 60 * 60 * 1000);
+        sqlx::query("UPDATE runs SET started_at = ? WHERE id = 'run-old'")
+            .bind(old_ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        finish_run(&pool, "run-old", 1).await.unwrap();
+
+        insert_run(&pool, "run-recent", "https://example.com", "fast")
+            .await
+            .unwrap();
+        finish_run(&pool, "run-recent", 1).await.unwrap();
+
+        // Unfinished run should be excluded from get_route_trend
+        insert_run(&pool, "run-unfinished", "https://example.com", "fast")
+            .await
+            .unwrap();
+
+        for (rid, s) in [("run-old", 0.70), ("run-recent", 0.92), ("run-unfinished", 0.50)] {
+            let rep = sample_route_report(
+                "r-home",
+                "/",
+                "https://example.com/",
+                None,
+                Some(WebVitalsSnapshot {
+                    fcp: Some(1000.0),
+                    lcp: Some(2000.0),
+                    cls: Some(0.05),
+                    ttfb: Some(200.0),
+                    tbt: Some(80.0),
+                    score: s,
+                }),
+                Some(200),
+            );
+            insert_route_score(&pool, rid, &rep).await.unwrap();
+        }
+
+        let trend = get_route_trend(&pool, "https://example.com", "/")
+            .await
+            .unwrap();
+        assert_eq!(trend.len(), 2);
+        assert_eq!(trend[0].run_id, "run-old");
+        assert!((trend[0].score.unwrap() - 0.70).abs() < 1e-6);
+        assert_eq!(trend[1].run_id, "run-recent");
+        assert!((trend[1].score.unwrap() - 0.92).abs() < 1e-6);
+
+        // Purge runs older than 30 days -> removes run-old and cascades its route_scores
+        let purged = purge_old_runs(&pool, 30).await.unwrap();
+        assert_eq!(purged, 1);
+
+        let old_scores = get_run_scores(&pool, "run-old").await.unwrap();
+        assert!(old_scores.is_empty());
+
+        let trend_after = get_route_trend(&pool, "https://example.com", "/")
+            .await
+            .unwrap();
+        assert_eq!(trend_after.len(), 1);
+        assert_eq!(trend_after[0].run_id, "run-recent");
+    }
+}

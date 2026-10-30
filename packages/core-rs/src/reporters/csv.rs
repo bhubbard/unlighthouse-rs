@@ -72,3 +72,90 @@ fn key_to_title(key: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, TaskMap,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_escape_csv_and_key_to_title() {
+        assert_eq!(escape_csv("/about"), "\"/about\"");
+        assert_eq!(escape_csv("/path\"with\"quotes"), "\"/path\"\"with\"\"quotes\"");
+        assert_eq!(key_to_title("bestPractices"), "BEST-PRACTICES");
+        assert_eq!(key_to_title("performance"), "PERFORMANCE");
+    }
+
+    #[test]
+    fn test_report_csv_simple() {
+        let mut categories = HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.924),
+                title: None,
+                key: None,
+            },
+        );
+        categories.insert(
+            "seo".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.886),
+                title: None,
+                key: None,
+            },
+        );
+
+        let r1 = RouteReport {
+            report_id: "1".to_string(),
+            route: NormalisedRoute {
+                id: "1".to_string(),
+                path: "/".to_string(),
+                url: "https://example.com/".to_string(),
+                definition: RouteDefinition {
+                    name: "/".to_string(),
+                    path: "/".to_string(),
+                },
+            },
+            artifact_path: "/tmp/1".to_string(),
+            artifact_url: "/1/".to_string(),
+            tasks: TaskMap::default(),
+            report: Some(LighthouseReport {
+                score: 0.905,
+                categories,
+                audits: serde_json::Value::Null,
+            }),
+            seo: None,
+            web_vitals: None,
+        };
+
+        let r2 = RouteReport {
+            report_id: "2".to_string(),
+            route: NormalisedRoute {
+                id: "2".to_string(),
+                path: "/missing".to_string(),
+                url: "https://example.com/missing".to_string(),
+                definition: RouteDefinition {
+                    name: "/missing".to_string(),
+                    path: "/missing".to_string(),
+                },
+            },
+            artifact_path: "/tmp/2".to_string(),
+            artifact_url: "/2/".to_string(),
+            tasks: TaskMap::default(),
+            report: None,
+            seo: None,
+            web_vitals: None,
+        };
+
+        let csv_str = report_csv_simple(&[r1, r2]).unwrap();
+        let lines: Vec<&str> = csv_str.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "URL,Score,PERFORMANCE,SEO");
+        assert_eq!(lines[1], "\"/\",91,92,89");
+        assert_eq!(lines[2], "\"/missing\",,,");
+    }
+}

@@ -545,6 +545,87 @@ async fn run_ci_mode(
 
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_cli_parse_all_flags_and_delimiters() {
+            let cli = Cli::try_parse_from([
+                "unlighthouse-rs",
+                "--site",
+                "https://example.com",
+                "--output-path",
+                ".out",
+                "--debug",
+                "--no-cache",
+                "--device",
+                "desktop",
+                "--samples",
+                "3",
+                "--throttle",
+                "--max-routes",
+                "50",
+                "--reporter",
+                "markdown",
+                "--build-static",
+                "--budget",
+                "85.5",
+                "--workers",
+                "4",
+                "--ci",
+                "--port",
+                "8080",
+                "--host",
+                "127.0.0.1",
+                "--include",
+                "/blog/*,/docs/*",
+                "--exclude",
+                "/admin/*,/private/*",
+                "--skip-javascript",
+                "--warmup",
+                "--block-assets",
+                "--browser",
+                "headless_chrome",
+                "--mode",
+                "fast",
+                "--purge-runs-older-than-days",
+                "14",
+            ])
+            .unwrap();
+
+            assert_eq!(cli.site.as_deref(), Some("https://example.com"));
+            assert_eq!(cli.output_path.as_deref(), Some(".out"));
+            assert!(cli.debug);
+            assert!(cli.no_cache);
+            assert_eq!(cli.device.as_deref(), Some("desktop"));
+            assert_eq!(cli.samples, Some(3));
+            assert!(cli.throttle);
+            assert_eq!(cli.max_routes, Some(50));
+            assert_eq!(cli.reporter.as_deref(), Some("markdown"));
+            assert!(cli.build_static);
+            assert_eq!(cli.budget, Some(85.5));
+            assert_eq!(cli.workers, Some(4));
+            assert!(cli.ci);
+            assert_eq!(cli.port, 8080);
+            assert_eq!(cli.host, "127.0.0.1");
+            assert_eq!(cli.include, vec!["/blog/*", "/docs/*"]);
+            assert_eq!(cli.exclude, vec!["/admin/*", "/private/*"]);
+            assert!(cli.skip_javascript);
+            assert!(cli.warmup);
+            assert!(cli.block_assets);
+            assert_eq!(cli.browser, "headless_chrome");
+            assert_eq!(cli.mode, "fast");
+            assert_eq!(cli.purge_runs_older_than_days, Some(14));
+        }
+
+        #[test]
+        fn test_cli_rejects_invalid_browser_or_mode() {
+            assert!(Cli::try_parse_from(["unlighthouse-rs", "--browser", "firefox"]).is_err());
+            assert!(Cli::try_parse_from(["unlighthouse-rs", "--mode", "invalid"]).is_err());
+        }
+    }
 } // end of mod native_cli
 
 #[cfg(feature = "native")]

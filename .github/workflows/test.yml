@@ -84,3 +84,18 @@ jobs:
       - run: pnpm i
       - run: pnpm build
       - run: pnpm test:e2e
+
+  test-rust:
+    name: Rust Core Tests (unlighthouse-rs)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packages/core-rs
+      - name: Ensure client dist directory exists for rust-embed
+        run: mkdir -p packages/client/dist
+      - name: Run Rust unit & integration tests
+        working-directory: packages/core-rs
+        run: cargo test --all-targets

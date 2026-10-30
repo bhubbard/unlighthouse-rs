@@ -182,3 +182,99 @@ pub async fn upload_to_lhci_server(
     info!("LHCI upload completed: {}/{} runs uploaded", uploaded_count, reports.len());
     Ok(format!("{}/app/projects/{}/compare", host, project_id))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{NormalisedRoute, RouteDefinition, TaskMap};
+    use axum::{routing::post, Json, Router};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_lhci_upload_missing_host_or_token() {
+        let mut config = Config::default();
+        assert!(upload_to_lhci_server(&[], &config).await.is_err());
+
+        config.ci.lhci_host = Some("http://localhost:9001".to_string());
+        assert!(upload_to_lhci_server(&[], &config).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_lhci_upload_end_to_end_with_mock_server() {
+        let app = Router::new()
+            .route(
+                "/api/projects/lookup",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["token"], "secret-build-token");
+                    Json(json!({ "id": "proj-123" }))
+                }),
+            )
+            .route(
+                "/api/projects/proj-123/builds",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["projectId"], "proj-123");
+                    Json(json!({ "id": "build-456" }))
+                }),
+            )
+            .route(
+                "/api/projects/proj-123/builds/build-456/runs",
+                post(|Json(body): Json<serde_json::Value>| async move {
+                    assert_eq!(body["projectId"], "proj-123");
+                    assert_eq!(body["buildId"], "build-456");
+                    assert!(
+                        (body["representativeResult"]["category_performance"]
+                            .as_f64()
+                            .unwrap()
+                            - 0.94)
+                            .abs()
+                            < 1e-6
+                    );
+                    Json(json!({ "id": "run-789" }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let report_json_path = dir.path().join("report.json");
+        std::fs::write(
+            &report_json_path,
+            r#"{"categories":{"performance":{"score":0.94},"seo":{"score":0.99}}}"#,
+        )
+        .unwrap();
+
+        let report = RouteReport {
+            report_id: "r1".to_string(),
+            route: NormalisedRoute {
+                id: "r1".to_string(),
+                path: "/".to_string(),
+                url: "https://example.com/".to_string(),
+                definition: RouteDefinition {
+                    name: "/".to_string(),
+                    path: "/".to_string(),
+                },
+            },
+            artifact_path: dir.path().to_str().unwrap().to_string(),
+            artifact_url: "/r1/".to_string(),
+            tasks: TaskMap::default(),
+            report: None,
+            seo: None,
+            web_vitals: None,
+        };
+
+        let mut config = Config::default();
+        config.ci.lhci_host = Some(format!("http://{addr}"));
+        config.ci.lhci_build_token = Some("secret-build-token".to_string());
+        config.ci.lhci_auth = Some("admin:password".to_string());
+
+        let compare_url = upload_to_lhci_server(&[report], &config).await.unwrap();
+        assert_eq!(
+            compare_url,
+            format!("http://{addr}/app/projects/proj-123/compare")
+        );
+    }
+}

@@ -32,7 +32,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<super::AppState>) {
         for report in reports.values() {
             let event = WsEvent::TaskComplete(report.clone());
             if let Ok(json) = serde_json::to_string(&event) {
-                if sender.send(Message::Text(json.into())).await.is_err() {
+                if sender.send(Message::Text(json)).await.is_err() {
                     return;
                 }
             }
@@ -44,7 +44,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<super::AppState>) {
         loop {
             match rx.recv().await {
                 Ok(msg) => {
-                    if sender.send(Message::Text(msg.into())).await.is_err() {
+                    if sender.send(Message::Text(msg)).await.is_err() {
                         break;
                     }
                 }
@@ -69,5 +69,27 @@ pub fn broadcast(tx: &WsBroadcast, event: &WsEvent) {
     if let Ok(json) = serde_json::to_string(event) {
         // Ignore send errors (no listeners)
         let _ = tx.send(json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ScanMeta;
+
+    #[test]
+    fn test_ws_broadcast_delivers_serialized_event() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let event = WsEvent::ScanMetaUpdate(ScanMeta {
+            routes: 3,
+            score: 0.91,
+            monitor: None,
+        });
+
+        broadcast(&tx, &event);
+        let msg = rx.try_recv().unwrap();
+        let val: serde_json::Value = serde_json::from_str(&msg).unwrap();
+        assert_eq!(val["event"], "scan-meta-update");
+        assert_eq!(val["data"]["routes"], 3);
     }
 }

@@ -22,7 +22,7 @@ pub fn create_route_report(route: &crate::types::NormalisedRoute, config: &Confi
     let artifact_path = PathBuf::from(&config.output_path)
         .join(sanitise_hostname(&config.site))
         .join(&route.id);
-    let artifact_url = format!("/{}/{}/", sanitise_hostname(&config.site), &route.id);
+    let artifact_url = format!("/{}/{}/", sanitise_hostname(&config.site), route.id);
 
     RouteReport {
         report_id: route.id.clone(),
@@ -103,11 +103,11 @@ pub async fn process_route(
                             break;
                         }
                         let new_route = normalise_route(&href, &config.site);
-                        if crate::discovery::routes::passes_filters(&new_route.path, &config.scanner.include, &config.scanner.exclude) {
-                            if !reports.contains_key(&new_route.id) {
-                                reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
-                                let _ = state.work_tx.send(new_route).await;
-                            }
+                        if crate::discovery::routes::passes_filters(&new_route.path, &config.scanner.include, &config.scanner.exclude)
+                            && !reports.contains_key(&new_route.id)
+                        {
+                            reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
+                            let _ = state.work_tx.send(new_route).await;
                         }
                     }
                 }
@@ -266,9 +266,17 @@ async fn run_lighthouse_fallback(
         _ => "mobile",
     };
 
-    let mut cmd = Command::new("node");
-    cmd.arg(&config.lighthouse_process_path)
-        .arg("--url").arg(url)
+    let is_js = config.lighthouse_process_path.ends_with(".js")
+        || config.lighthouse_process_path.ends_with(".mjs")
+        || config.lighthouse_process_path.ends_with(".cjs");
+    let mut cmd = if is_js {
+        let mut c = Command::new("node");
+        c.arg(&config.lighthouse_process_path);
+        c
+    } else {
+        Command::new(&config.lighthouse_process_path)
+    };
+    cmd.arg("--url").arg(url)
         .arg("--output-dir").arg(artifact_path)
         .arg("--device").arg(device_str);
     if config.scanner.throttle {
@@ -383,5 +391,117 @@ pub async fn run_worker_loop(
         tokio::spawn(async move {
             process_route(route, state2, browser2).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ScanMode;
+    use crate::queue::browser::launch_reqwest;
+    use axum::{routing::get, Router};
+    use serde_json::json;
+
+    #[test]
+    fn test_sanitise_hostname_and_create_route_report() {
+        assert_eq!(sanitise_hostname("https://example.com/foo"), "example.com");
+        assert_eq!(sanitise_hostname("not a url"), "unknown");
+
+        let config = Config {
+            site: "https://example.com".to_string(),
+            output_path: "/tmp/out".to_string(),
+            ..Default::default()
+        };
+        let route = normalise_route("https://example.com/about", "https://example.com");
+        let rep = create_route_report(&route, &config);
+        assert_eq!(rep.report_id, route.id);
+        assert!(rep.artifact_path.ends_with(&format!("example.com/{}", route.id)));
+        assert_eq!(rep.artifact_url, format!("/example.com/{}/", route.id));
+        assert_eq!(rep.tasks.inspect_html_task, TaskStatus::Waiting);
+        assert_eq!(rep.tasks.run_lighthouse_task, TaskStatus::Waiting);
+    }
+
+    #[test]
+    fn test_parse_lighthouse_report() {
+        let raw = json!({
+            "categories": {
+                "performance": { "score": 0.80, "title": "Performance" },
+                "seo": { "score": 1.00, "title": "SEO" }
+            },
+            "audits": {
+                "first-contentful-paint": { "numericValue": 1200.0 }
+            }
+        });
+
+        let parsed = parse_lighthouse_report(&raw).unwrap();
+        assert!((parsed.score - 0.90).abs() < 1e-6);
+        assert_eq!(parsed.categories.len(), 2);
+        assert_eq!(
+            parsed.audits["first-contentful-paint"]["numericValue"],
+            1200.0
+        );
+
+        // Missing categories returns error
+        assert!(parse_lighthouse_report(&json!({})).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_process_route_and_worker_loop_discovers_links() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let site = format!("http://{addr}");
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    r#"<html><head><title>Home</title></head>
+                    <body><a href="/discovered">Discovered</a></body></html>"#
+                }),
+            )
+            .route(
+                "/discovered",
+                get(|| async { r#"<html><head><title>Discovered</title></head><body></body></html>"# }),
+            );
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unlighthouse.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        crate::db::insert_run(&db, "run-test", &site, "fast")
+            .await
+            .unwrap();
+
+        let mut cfg = Config {
+            site: site.clone(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            mode: ScanMode::Fast,
+            ..Default::default()
+        };
+        cfg.scanner.max_routes = Some(2);
+        let config = Arc::new(cfg);
+
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::channel(16);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            work_tx.clone(),
+            None,
+            db,
+            "run-test".to_string(),
+        ));
+        let browser = launch_reqwest(&config).unwrap();
+
+        let root_route = normalise_route(&format!("{site}/"), &site);
+        process_route(root_route, Arc::clone(&state), browser).await;
+
+        // Verify root route was inspected and discovered `/discovered` into work_rx
+        let discovered_route = work_rx.try_recv().expect("Expected discovered route in queue");
+        assert_eq!(discovered_route.path, "/discovered");
+
+        let reports = state.route_reports.read().await;
+        assert_eq!(reports.len(), 2); // root + pre-registered /discovered
     }
 }

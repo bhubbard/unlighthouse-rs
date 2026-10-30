@@ -20,10 +20,22 @@ pub async fn run_mcp_server(state: Arc<AppState>) -> anyhow::Result<()> {
             Err(_) => continue,
         };
 
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let response = handle_mcp_request(&state, &request).await;
 
-        let response = match method {
+        let response_str = serde_json::to_string(&response)? + "\n";
+        stdout.write_all(response_str.as_bytes()).await?;
+        stdout.flush().await?;
+    }
+
+    Ok(())
+}
+
+/// Process a single MCP JSON-RPC request against `AppState` and return the JSON-RPC response.
+pub async fn handle_mcp_request(state: &Arc<AppState>, request: &Value) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+    match method {
             "initialize" => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -309,12 +321,237 @@ pub async fn run_mcp_server(state: Arc<AppState>) -> anyhow::Result<()> {
                 "id": id,
                 "error": { "code": -32601, "message": "Method not found" }
             }),
+        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, RouteReport,
+        TaskMap, TaskStatus,
+    };
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_mcp_all_jsonrpc_methods_and_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mcp.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        crate::db::insert_run(&db, "run-mcp", "https://example.com", "full")
+            .await
+            .unwrap();
+
+        let config = Arc::new(Config {
+            site: "https://example.com".to_string(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        });
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::channel(16);
+        let state = Arc::new(AppState::new(
+            config,
+            work_tx,
+            None,
+            db,
+            "run-mcp".to_string(),
+        ));
+
+        let mut categories = HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.95),
+                title: None,
+                key: None,
+            },
+        );
+        let rep = RouteReport {
+            report_id: "r1".to_string(),
+            route: NormalisedRoute {
+                id: "r1".to_string(),
+                path: "/about".to_string(),
+                url: "https://example.com/about".to_string(),
+                definition: RouteDefinition {
+                    name: "/about".to_string(),
+                    path: "/about".to_string(),
+                },
+            },
+            artifact_path: "/tmp/r1".to_string(),
+            artifact_url: "/r1/".to_string(),
+            tasks: TaskMap {
+                inspect_html_task: TaskStatus::Completed,
+                run_lighthouse_task: TaskStatus::Completed,
+            },
+            report: Some(LighthouseReport {
+                score: 0.95,
+                categories,
+                audits: serde_json::Value::Null,
+            }),
+            seo: None,
+            web_vitals: None,
         };
 
-        let response_str = serde_json::to_string(&response)? + "\n";
-        stdout.write_all(response_str.as_bytes()).await?;
-        stdout.flush().await?;
-    }
+        state.route_reports.write().await.insert("r1".to_string(), rep.clone());
+        crate::db::insert_route_score(&state.db, "run-mcp", &rep)
+            .await
+            .unwrap();
+        crate::db::finish_run(&state.db, "run-mcp", 1).await.unwrap();
 
-    Ok(())
+        // 1. initialize
+        let init_resp = handle_mcp_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+        )
+        .await;
+        assert_eq!(init_resp["result"]["serverInfo"]["name"], "unlighthouse-rs");
+
+        // 2. tools/list
+        let list_resp = handle_mcp_request(
+            &state,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 7);
+
+        // 3. tools/call -> list_reports
+        let lr_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "list_reports", "arguments": {} }
+            }),
+        )
+        .await;
+        assert!(lr_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/about"));
+
+        // 4. tools/call -> get_report_details (found & not found)
+        let det_ok = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "name": "get_report_details", "arguments": { "id": "r1" } }
+            }),
+        )
+        .await;
+        assert!(det_ok["result"].is_object());
+
+        let det_err = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "get_report_details", "arguments": { "id": "missing" } }
+            }),
+        )
+        .await;
+        assert_eq!(det_err["error"]["code"], -32602);
+
+        // 5. tools/call -> list_runs, get_run_scores, get_route_history
+        let runs_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "list_runs", "arguments": { "limit": 5 } }
+            }),
+        )
+        .await;
+        assert!(runs_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("run-mcp"));
+
+        let scores_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "get_run_scores", "arguments": { "runId": "run-mcp" } }
+            }),
+        )
+        .await;
+        assert!(scores_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/about"));
+
+        let hist_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": { "name": "get_route_history", "arguments": { "path": "/about" } }
+            }),
+        )
+        .await;
+        assert!(hist_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("run-mcp"));
+
+        // 6. tools/call -> rescan_route & rescan_all
+        let rescan_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": { "name": "rescan_route", "arguments": { "path": "/about" } }
+            }),
+        )
+        .await;
+        assert!(rescan_resp["result"].is_object());
+        assert_eq!(work_rx.try_recv().unwrap().path, "/about");
+
+        // Re-insert and test rescan_all
+        state.route_reports.write().await.insert("r1".to_string(), rep);
+        let rescan_all_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": { "name": "rescan_all", "arguments": {} }
+            }),
+        )
+        .await;
+        assert!(rescan_all_resp["result"].is_object());
+        assert_eq!(work_rx.try_recv().unwrap().path, "/about");
+
+        // 7. Unknown tool & unknown method
+        let unk_tool = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": { "name": "nonexistent_tool" }
+            }),
+        )
+        .await;
+        assert_eq!(unk_tool["error"]["code"], -32601);
+
+        let unk_method = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "unknown/method"
+            }),
+        )
+        .await;
+        assert_eq!(unk_method["error"]["code"], -32601);
+    }
 }

@@ -41,9 +41,17 @@ pub struct PersistentWorker {
 
 impl PersistentWorker {
     pub async fn launch(config: &Config) -> Result<Self> {
-        let mut cmd = Command::new("node");
-        cmd.arg(&config.lighthouse_process_path)
-            .arg("--persistent")
+        let is_js = config.lighthouse_process_path.ends_with(".js")
+            || config.lighthouse_process_path.ends_with(".mjs")
+            || config.lighthouse_process_path.ends_with(".cjs");
+        let mut cmd = if is_js {
+            let mut c = Command::new("node");
+            c.arg(&config.lighthouse_process_path);
+            c
+        } else {
+            Command::new(&config.lighthouse_process_path)
+        };
+        cmd.arg("--persistent")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -108,5 +116,98 @@ impl LighthousePool {
             }
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_task_and_result_serde() {
+        let task = AuditTask {
+            url: "https://example.com/".to_string(),
+            output_dir: "/tmp/out".to_string(),
+            device: "mobile".to_string(),
+            throttle: true,
+            skip_javascript: false,
+            block_assets: true,
+            warmup: false,
+            auth: None,
+            cookies: None,
+            local_storage: None,
+            session_storage: None,
+            extra_headers: None,
+            user_agent: Some("Bot/1.0".to_string()),
+        };
+
+        let val = serde_json::to_value(&task).unwrap();
+        assert_eq!(val["outputDir"], "/tmp/out");
+        assert_eq!(val["skipJavascript"], false);
+        assert_eq!(val["blockAssets"], true);
+        assert_eq!(val["userAgent"], "Bot/1.0");
+
+        let res_json = r#"{"success":true,"url":"https://example.com/","scores":{"performance":0.91},"error":null}"#;
+        let res: AuditResult = serde_json::from_str(res_json).unwrap();
+        assert!(res.success);
+        assert_eq!(res.scores.unwrap().get("performance"), Some(&0.91));
+    }
+
+    #[tokio::test]
+    async fn test_lighthouse_pool_with_mock_worker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("mock_worker.sh");
+        std::fs::write(
+            &script_path,
+            r#"#!/usr/bin/env bash
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    echo 'JSON_RESULT:{"success":true,"url":"https://example.com/test","scores":{"performance":0.96,"seo":1.0},"error":null}'
+done
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let config = Config {
+            lighthouse_process_path: script_path.to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+
+        let pool = LighthousePool::new(&config, 1).await.unwrap();
+        assert_eq!(pool.active_workers(), 0);
+
+        let worker_arc = pool.acquire_worker().await;
+        let mut guard = worker_arc.lock().await;
+        assert_eq!(pool.active_workers(), 1);
+
+        let res = guard
+            .audit(AuditTask {
+                url: "https://example.com/test".to_string(),
+                output_dir: dir.path().to_str().unwrap().to_string(),
+                device: "desktop".to_string(),
+                throttle: false,
+                skip_javascript: false,
+                block_assets: false,
+                warmup: false,
+                auth: None,
+                cookies: None,
+                local_storage: None,
+                session_storage: None,
+                extra_headers: None,
+                user_agent: None,
+            })
+            .await
+            .unwrap();
+
+        drop(guard);
+        assert_eq!(pool.active_workers(), 0);
+        assert!(res.success);
+        assert_eq!(res.url, "https://example.com/test");
+        assert_eq!(res.scores.unwrap().get("performance"), Some(&0.96));
     }
 }

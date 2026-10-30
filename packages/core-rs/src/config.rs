@@ -801,4 +801,126 @@ mod tests {
     fn bool_to_option(b: bool) -> bool {
         b
     }
+
+    #[test]
+    fn test_scan_mode_parsing() {
+        assert_eq!("full".parse::<ScanMode>().unwrap(), ScanMode::Full);
+        assert_eq!("fast".parse::<ScanMode>().unwrap(), ScanMode::Fast);
+        assert!("turbo".parse::<ScanMode>().is_err());
+    }
+
+    #[test]
+    fn test_budget_rule_violations() {
+        use crate::types::LighthouseCategoryScore;
+        let mut categories = std::collections::HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.75),
+                title: Some("Performance".to_string()),
+                key: Some("performance".to_string()),
+            },
+        );
+        categories.insert(
+            "accessibility".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.95),
+                title: Some("Accessibility".to_string()),
+                key: Some("accessibility".to_string()),
+            },
+        );
+        categories.insert(
+            "best-practices".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.80),
+                title: None,
+                key: None,
+            },
+        );
+        categories.insert(
+            "seo".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.90),
+                title: None,
+                key: None,
+            },
+        );
+
+        let rule = BudgetRule {
+            path: "/**".to_string(),
+            score: Some(90.0),
+            performance: Some(80.0),
+            accessibility: Some(90.0),
+            best_practices: Some(85.0),
+            seo: Some(90.0),
+        };
+
+        let violations = rule.violations(&categories, 0.85);
+        assert_eq!(violations.len(), 3);
+        let labels: Vec<&str> = violations.iter().map(|v| v.label.as_str()).collect();
+        assert!(labels.contains(&"score"));
+        assert!(labels.contains(&"performance"));
+        assert!(labels.contains(&"best-practices"));
+        assert!(!labels.contains(&"accessibility"));
+        assert!(!labels.contains(&"seo"));
+    }
+
+    #[test]
+    fn test_load_config_from_toml_and_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. TOML file
+        let toml_path = dir.path().join("unlighthouse.config.toml");
+        std::fs::write(
+            &toml_path,
+            r#"
+site = "https://toml-example.com"
+port = 4321
+mode = "fast"
+
+[scanner]
+maxRoutes = 42
+device = "desktop"
+
+[ci]
+reporter = "csv"
+budget = 88.5
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config(
+            Some(&toml_path),
+            CliOverrides {
+                port: Some(5555),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.site, "https://toml-example.com");
+        assert_eq!(cfg.port, 5555); // CLI overrides file
+        assert_eq!(cfg.mode, ScanMode::Fast);
+        assert_eq!(cfg.scanner.max_routes, Some(42));
+        assert_eq!(cfg.scanner.device, Device::Desktop);
+        assert_eq!(cfg.ci.reporter, ReporterType::CsvSimple);
+        assert_eq!(cfg.ci.budget, Some(88.5));
+
+        // 2. JSON file
+        let json_path = dir.path().join("unlighthouse.config.json");
+        std::fs::write(
+            &json_path,
+            r#"{
+                "site": "https://json-example.com",
+                "workers": 6,
+                "ci": { "reporter": "jsonExpanded", "enabled": true }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg_json = load_config(Some(&json_path), CliOverrides::default()).unwrap();
+        assert_eq!(cfg_json.site, "https://json-example.com");
+        assert_eq!(cfg_json.workers, 6);
+        assert_eq!(cfg_json.ci.reporter, ReporterType::JsonExpanded);
+        assert!(cfg_json.ci.enabled);
+    }
 }

@@ -92,3 +92,102 @@ pub fn report_json_simple(reports: &[RouteReport]) -> Result<String> {
 pub fn report_json_expanded(reports: &[RouteReport]) -> Result<String> {
     Ok(serde_json::to_string_pretty(reports)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, SeoData,
+        TaskMap, WebVitalsSnapshot,
+    };
+
+    #[test]
+    fn test_report_json_simple_full_and_fast_modes() {
+        let mut categories = HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.95),
+                title: None,
+                key: None,
+            },
+        );
+
+        let full_rep = RouteReport {
+            report_id: "r1".to_string(),
+            route: NormalisedRoute {
+                id: "r1".to_string(),
+                path: "/full".to_string(),
+                url: "https://example.com/full".to_string(),
+                definition: RouteDefinition {
+                    name: "/full".to_string(),
+                    path: "/full".to_string(),
+                },
+            },
+            artifact_path: "/tmp/r1".to_string(),
+            artifact_url: "/r1/".to_string(),
+            tasks: TaskMap::default(),
+            report: Some(LighthouseReport {
+                score: 0.95,
+                categories,
+                audits: serde_json::json!({"lcp": 1200}),
+            }),
+            seo: Some(SeoData {
+                status_code: Some(200),
+                ..Default::default()
+            }),
+            web_vitals: None,
+        };
+
+        let fast_rep = RouteReport {
+            report_id: "r2".to_string(),
+            route: NormalisedRoute {
+                id: "r2".to_string(),
+                path: "/fast".to_string(),
+                url: "https://example.com/fast".to_string(),
+                definition: RouteDefinition {
+                    name: "/fast".to_string(),
+                    path: "/fast".to_string(),
+                },
+            },
+            artifact_path: "/tmp/r2".to_string(),
+            artifact_url: "/r2/".to_string(),
+            tasks: TaskMap::default(),
+            report: None,
+            seo: Some(SeoData {
+                status_code: Some(301),
+                redirect_to: Some("https://example.com/dest".to_string()),
+                ..Default::default()
+            }),
+            web_vitals: Some(WebVitalsSnapshot {
+                fcp: Some(900.0),
+                lcp: Some(1800.0),
+                cls: Some(0.01),
+                ttfb: Some(120.0),
+                tbt: Some(30.0),
+                score: 0.98,
+            }),
+        };
+
+        let simple_str = report_json_simple(&[full_rep.clone(), fast_rep.clone()]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&simple_str).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr[0]["path"], "/full");
+        assert!((arr[0]["score"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        assert!((arr[0]["categories"]["performance"].as_f64().unwrap() - 0.95).abs() < 1e-6);
+        assert_eq!(arr[0]["status_code"], 200);
+        assert!(arr[0].get("vitals_score").is_none());
+
+        assert_eq!(arr[1]["path"], "/fast");
+        assert!((arr[1]["score"].as_f64().unwrap() - 0.98).abs() < 1e-6);
+        assert!((arr[1]["vitals_score"].as_f64().unwrap() - 0.98).abs() < 1e-6);
+        assert_eq!(arr[1]["lcp"], 1800.0);
+        assert_eq!(arr[1]["redirect_to"], "https://example.com/dest");
+
+        let expanded_str = report_json_expanded(&[full_rep]).unwrap();
+        let exp_val: serde_json::Value = serde_json::from_str(&expanded_str).unwrap();
+        assert_eq!(exp_val[0]["report"]["audits"]["lcp"], 1200);
+    }
+}

@@ -192,3 +192,52 @@ pub enum WsEvent {
     TaskComplete(RouteReport),
     ScanMetaUpdate(ScanMeta),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_seo_data_health_helpers() {
+        let mut seo = SeoData::default();
+        assert!(!seo.is_error());
+        assert!(!seo.is_redirect());
+
+        seo.status_code = Some(200);
+        assert!(!seo.is_error());
+
+        seo.status_code = Some(301);
+        seo.redirect_to = Some("https://example.com/new".to_string());
+        assert!(!seo.is_error());
+        assert!(seo.is_redirect());
+
+        seo.status_code = Some(404);
+        assert!(seo.is_error());
+
+        seo.status_code = Some(503);
+        assert!(seo.is_error());
+    }
+
+    #[test]
+    fn test_task_status_serde_kebab_case() {
+        assert_eq!(TaskStatus::default(), TaskStatus::Waiting);
+        assert_eq!(serde_json::to_string(&TaskStatus::InProgress).unwrap(), "\"in-progress\"");
+        assert_eq!(serde_json::to_string(&TaskStatus::FailedRetry).unwrap(), "\"failed-retry\"");
+        let parsed: TaskStatus = serde_json::from_str("\"completed\"").unwrap();
+        assert_eq!(parsed, TaskStatus::Completed);
+    }
+
+    #[test]
+    fn test_ws_event_serde_tag_and_content() {
+        let meta = ScanMeta {
+            routes: 5,
+            score: 0.92,
+            monitor: None,
+        };
+        let event = WsEvent::ScanMetaUpdate(meta);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["event"], "scan-meta-update");
+        assert_eq!(json["data"]["routes"], 5);
+        assert!((json["data"]["score"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+    }
+}

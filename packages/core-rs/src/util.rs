@@ -117,5 +117,23 @@ mod tests {
         assert_eq!(url_to_path("https://example.com/foo/bar"), "/foo/bar");
         assert_eq!(url_to_path("https://example.com/"), "/");
         assert_eq!(url_to_path("https://example.com"), "/");
+        assert_eq!(url_to_path("not a valid url"), "not a valid url");
+    }
+
+    #[test]
+    fn test_url_origin_and_format_bytes() {
+        assert_eq!(
+            url_origin("http://localhost:8080/test/page"),
+            Some("http://localhost:8080".to_string())
+        );
+        assert_eq!(url_origin("not-a-url"), None);
+        assert!(is_same_origin(
+            "HTTPS://Example.COM/a",
+            "https://example.com/b"
+        ));
+
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(2048), "2.0 KB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MB");
     }
 }

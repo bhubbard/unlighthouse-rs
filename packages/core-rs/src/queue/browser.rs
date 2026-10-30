@@ -72,7 +72,7 @@ async fn inspect_reqwest(
         .filter(|d| !d.is_empty());
 
     let anchor_sel = scraper::Selector::parse("a[href]").expect("hardcoded CSS selector is valid");
-    let origin = format!("{}://{}", base_url.scheme(), base_url.host_str().unwrap_or(""));
+    let base_url_str = base_url.to_string();
 
     let mut internal_hrefs: Vec<String> = Vec::new();
     let mut external_count = 0usize;
@@ -86,7 +86,7 @@ async fn inspect_reqwest(
             Ok(u) => u.to_string(),
             Err(_) => continue,
         };
-        if resolved.starts_with(&origin) {
+        if crate::util::is_same_origin(&base_url_str, &resolved) {
             internal_hrefs.push(resolved);
         } else if resolved.starts_with("http://") || resolved.starts_with("https://") {
             external_count += 1;
@@ -302,6 +302,7 @@ pub enum BrowserHandle {
     /// Sync CDP client (stable)
     HeadlessChrome(Arc<headless_chrome::Browser>, Arc<crate::config::Config>),
     /// Async CDP client (may crash on some Chrome builds)
+    #[cfg(feature = "chromiumoxide-backend")]
     Chromiumoxide(Arc<chromiumoxide::Browser>, Arc<crate::config::Config>),
 }
 
@@ -310,6 +311,7 @@ impl BrowserHandle {
         match self {
             BrowserHandle::Reqwest(c, _)          => inspect_reqwest(c, url).await,
             BrowserHandle::HeadlessChrome(b, cfg) => inspect_headless(b, cfg, url).await,
+            #[cfg(feature = "chromiumoxide-backend")]
             BrowserHandle::Chromiumoxide(b, cfg)  => inspect_chromiumoxide(b, cfg, url).await,
         }
     }
@@ -329,6 +331,7 @@ impl BrowserHandle {
             BrowserHandle::HeadlessChrome(b, cfg) => {
                 measure_vitals_headless(b, cfg, url).await.map(Some)
             }
+            #[cfg(feature = "chromiumoxide-backend")]
             BrowserHandle::Chromiumoxide(b, cfg) => {
                 measure_vitals_chromiumoxide(b, cfg, url).await.map(Some)
             }
@@ -450,6 +453,7 @@ async fn inspect_headless(
 
 // ── chromiumoxide backend ─────────────────────────────────────────────────────
 
+#[cfg(feature = "chromiumoxide-backend")]
 async fn inspect_chromiumoxide(
     browser: &Arc<chromiumoxide::Browser>,
     config: &Arc<crate::config::Config>,
@@ -648,6 +652,7 @@ async fn measure_vitals_headless(
 
 // ── chromiumoxide vitals measurement ─────────────────────────────────────────
 
+#[cfg(feature = "chromiumoxide-backend")]
 async fn measure_vitals_chromiumoxide(
     browser: &Arc<chromiumoxide::Browser>,
     config: &Arc<crate::config::Config>,
@@ -817,6 +822,7 @@ pub fn launch_headless_chrome(config: &Arc<crate::config::Config>) -> Result<Bro
 /// **Note:** chromiumoxide may crash on `chrome-untrusted://` CDP events
 /// emitted by some Chrome versions during startup. Use headless_chrome
 /// if you hit `WS Connection error: Serde(...)` on startup.
+#[cfg(feature = "chromiumoxide-backend")]
 pub async fn launch_chromiumoxide(config: &Arc<crate::config::Config>) -> Result<BrowserHandle> {
     use futures::StreamExt;
 
@@ -848,4 +854,163 @@ pub async fn launch_chromiumoxide(config: &Arc<crate::config::Config>) -> Result
     });
 
     Ok(BrowserHandle::Chromiumoxide(Arc::new(browser), Arc::clone(config)))
+}
+
+#[cfg(not(feature = "chromiumoxide-backend"))]
+pub async fn launch_chromiumoxide(config: &Arc<crate::config::Config>) -> Result<BrowserHandle> {
+    launch_headless_chrome(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AuthConfig, Config, CookieConfig};
+    use axum::{
+        http::HeaderMap,
+        response::Redirect,
+        routing::get,
+        Router,
+    };
+
+    #[test]
+    fn test_score_metric_and_compute_vitals_score() {
+        // Good / Poor / Midpoint
+        assert!((score_metric(2000.0, 2500.0, 4000.0) - 1.0).abs() < 1e-6);
+        assert!((score_metric(4500.0, 2500.0, 4000.0) - 0.0).abs() < 1e-6);
+        assert!((score_metric(3250.0, 2500.0, 4000.0) - 0.5).abs() < 1e-6);
+
+        // All good metrics -> 1.0
+        let perfect = compute_vitals_score(
+            Some(1000.0),
+            Some(2000.0),
+            Some(0.05),
+            Some(400.0),
+            Some(100.0),
+        );
+        assert!((perfect - 1.0).abs() < 1e-6);
+
+        // All poor metrics -> 0.0
+        let poor = compute_vitals_score(
+            Some(4000.0),
+            Some(5000.0),
+            Some(0.40),
+            Some(2500.0),
+            Some(900.0),
+        );
+        assert!((poor - 0.0).abs() < 1e-6);
+
+        // Partial metrics (only LCP midpoint = 0.5, others None) -> renormalized to 0.5
+        let partial = compute_vitals_score(None, Some(3250.0), None, None, None);
+        assert!((partial - 0.5).abs() < 1e-6);
+
+        // No metrics -> 0.0
+        assert_eq!(compute_vitals_score(None, None, None, None, None), 0.0);
+    }
+
+    #[test]
+    fn test_parse_vitals_and_parse_cdp_result() {
+        let vitals_json = r#"{"fcp":1200.0,"lcp":2100.0,"cls":0.04,"ttfb":300.0,"tbt":80.0}"#;
+        let snap = parse_vitals(vitals_json).unwrap();
+        assert_eq!(snap.fcp, Some(1200.0));
+        assert_eq!(snap.lcp, Some(2100.0));
+        assert!((snap.score - 1.0).abs() < 1e-6);
+
+        let cdp_json = r#"{
+            "title": "Welcome",
+            "description": "",
+            "internalLinks": 4,
+            "externalLinks": 2,
+            "htmlSize": 1024,
+            "hrefs": ["https://example.com/a"],
+            "statusCode": 200,
+            "finalUrl": "https://example.com/new"
+        }"#;
+        let (seo, hrefs) = parse_cdp_result(cdp_json, "https://example.com/old").unwrap();
+        assert_eq!(seo.title.as_deref(), Some("Welcome"));
+        assert!(seo.description.is_none()); // empty filtered to None
+        assert_eq!(seo.internal_links, Some(4));
+        assert_eq!(seo.external_links, Some(2));
+        assert_eq!(seo.status_code, Some(200));
+        assert_eq!(seo.redirect_to.as_deref(), Some("https://example.com/new"));
+        assert_eq!(hrefs, vec!["https://example.com/a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_reqwest_inspect_html_and_redirects_and_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let site = format!("http://{addr}");
+
+        let app = Router::new()
+            .route(
+                "/page",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers.get("authorization").is_some());
+                    assert_eq!(
+                        headers.get("x-custom").and_then(|v| v.to_str().ok()),
+                        Some("custom-val")
+                    );
+                    r#"<!DOCTYPE html>
+                    <html>
+                    <head>
+                        <title>Test Page</title>
+                        <meta name="description" content="A great description">
+                        <link rel="canonical" href="/canonical-page">
+                    </head>
+                    <body>
+                        <a href="/internal-1">One</a>
+                        <a href="sub/internal-2">Two</a>
+                        <a href="https://external.example.org/out">Ext</a>
+                    </body>
+                    </html>"#
+                }),
+            )
+            .route("/old", get(|| async { Redirect::temporary("/page") }));
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("x-custom".to_string(), "custom-val".to_string());
+
+        let config = Arc::new(Config {
+            site: site.clone(),
+            auth: Some(AuthConfig {
+                username: "admin".to_string(),
+                password: "secret".to_string(),
+            }),
+            cookies: Some(vec![CookieConfig {
+                name: "sid".to_string(),
+                value: "xyz".to_string(),
+                domain: None,
+                path: Some("/".to_string()),
+            }]),
+            extra_headers: Some(extra_headers),
+            user_agent: Some("CustomBot/1.0".to_string()),
+            ..Default::default()
+        });
+
+        let browser = launch_reqwest(&config).unwrap();
+
+        // Reqwest backend returns None for measure_vitals
+        assert!(browser.measure_vitals(&format!("{site}/page")).await.unwrap().is_none());
+
+        // Inspect redirected URL (/old -> /page)
+        let (seo, links) = browser.inspect_html(&format!("{site}/old")).await.unwrap();
+        assert_eq!(seo.title.as_deref(), Some("Test Page"));
+        assert_eq!(seo.description.as_deref(), Some("A great description"));
+        assert_eq!(seo.canonical_url, Some(format!("{site}/canonical-page")));
+        assert_eq!(seo.redirect_to, Some(format!("{site}/page")));
+        assert_eq!(seo.status_code, Some(200));
+        assert_eq!(seo.internal_links, Some(2));
+        assert_eq!(seo.external_links, Some(1));
+        assert_eq!(
+            links,
+            vec![
+                format!("{site}/internal-1"),
+                format!("{site}/sub/internal-2")
+            ]
+        );
+    }
 }

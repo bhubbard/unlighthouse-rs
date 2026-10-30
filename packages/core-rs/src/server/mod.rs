@@ -399,3 +399,126 @@ pub async fn start_server(
     axum::serve(listener, final_app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    #[test]
+    fn test_default_columns_and_build_payload() {
+        let mut config = Config {
+            site: "https://example.com".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 7000,
+            ..Default::default()
+        };
+        config.scanner.device = crate::config::Device::Desktop;
+
+        let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
+        let payload = build_payload(&config, addr);
+
+        assert_eq!(payload["appName"], "UnLighthouse-RS");
+        assert_eq!(payload["options"]["site"], "https://example.com");
+        assert_eq!(payload["options"]["apiUrl"], "http://127.0.0.1:7000/api");
+        assert_eq!(payload["options"]["websocketUrl"], "ws://127.0.0.1:7000/api/ws");
+        assert_eq!(payload["options"]["routerPrefix"], "/");
+        assert_eq!(payload["options"]["scanner"]["device"], "desktop");
+        assert!(payload["options"]["client"]["columns"]["performance"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_index_favicon_and_security_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_dir = dir.path().join("client");
+        let assets_dir = client_dir.join("assets");
+        std::fs::create_dir_all(&assets_dir).unwrap();
+        std::fs::write(
+            client_dir.join("index.html"),
+            "<html><head><title>App</title></head><body>Hello</body></html>",
+        )
+        .unwrap();
+        std::fs::write(assets_dir.join("logo.svg"), "<svg></svg>").unwrap();
+
+        let db_path = dir.path().join("srv.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+
+        let config = Arc::new(Config {
+            site: "https://example.com".to_string(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        });
+        let (work_tx, _work_rx) = tokio::sync::mpsc::channel(8);
+        let state = Arc::new(AppState::new(
+            config,
+            work_tx,
+            None,
+            db,
+            "run-srv".to_string(),
+        ));
+
+        let app = Router::new()
+            .route("/", get(index_handler))
+            .route("/favicon.ico", get(favicon_handler))
+            .route("/assets/bundle.js", get(|| async { "console.log(1);" }))
+            .with_state(state)
+            .layer(axum::middleware::from_fn(add_security_headers));
+
+        // 1. GET / injects window.__unlighthouse_payload and sets security headers
+        let resp = app
+            .clone()
+            .oneshot(axum::http::Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-frame-options").unwrap(),
+            "SAMEORIGIN"
+        );
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=3600"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("window.__unlighthouse_payload ="));
+        assert!(html.contains("https://example.com"));
+
+        // 2. GET /favicon.ico serves SVG with max-age=3600
+        let fav = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/favicon.ico")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fav.status(), StatusCode::OK);
+        assert_eq!(
+            fav.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
+
+        // 3. GET /assets/bundle.js sets immutable Cache-Control
+        let asset_resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/assets/bundle.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            asset_resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+    }
+}

@@ -110,12 +110,9 @@ async fn parse_sitemap_xml(
                 }
             }
             Ok(Event::End(ref e)) => {
-                match e.name().as_ref() {
-                    b"loc" => {
-                        in_url_loc = false;
-                        in_sitemap_loc = false;
-                    }
-                    _ => {}
+                if e.name().as_ref() == b"loc" {
+                    in_url_loc = false;
+                    in_sitemap_loc = false;
                 }
             }
             Ok(Event::Eof) => break,
@@ -188,4 +185,106 @@ pub async fn extract_sitemap_routes(
     let ignored = total - filtered.len();
 
     Ok((filtered, ignored))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_parse_sitemap_xml_urlset_and_entities() {
+        let client = reqwest::Client::new();
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <url><loc>https://example.com/</loc></url>
+            <url><loc>https://example.com/search?a=1&amp;b=2</loc></url>
+        </urlset>"#;
+
+        let urls = parse_sitemap_xml(&client, xml, "https://example.com", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.com/".to_string(),
+                "https://example.com/search?a=1&b=2".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_sitemap_max_recursion_depth() {
+        let client = reqwest::Client::new();
+        let urls = fetch_sitemap_urls(
+            &client,
+            "https://example.com/sitemap.xml",
+            "https://example.com",
+            6,
+        )
+        .await
+        .unwrap();
+        assert!(urls.is_empty());
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn test_sitemap_index_txt_and_cross_origin_filtering() {
+        use axum::{extract::State, routing::get, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+
+        let app = Router::new()
+            .route(
+                "/sitemap_index.xml",
+                get(|State(base): State<String>| async move {
+                    format!(
+                        r#"<sitemapindex>
+                            <sitemap><loc>{base}/sub.xml</loc></sitemap>
+                            <sitemap><loc>{base}/list.txt</loc></sitemap>
+                        </sitemapindex>"#
+                    )
+                }),
+            )
+            .route(
+                "/sub.xml",
+                get(|State(base): State<String>| async move {
+                    format!(
+                        r#"<urlset>
+                            <url><loc>{base}/page-1</loc></url>
+                            <url><loc>https://other-domain.com/foreign</loc></url>
+                        </urlset>"#
+                    )
+                }),
+            )
+            .route(
+                "/list.txt",
+                get(|State(base): State<String>| async move {
+                    format!("{base}/page-2\n# comment line\n{base}/page-3\n")
+                }),
+            )
+            .with_state(base.clone());
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let (mut urls, ignored) =
+            extract_sitemap_routes(&client, &base, &["/sitemap_index.xml".to_string()])
+                .await
+                .unwrap();
+        urls.sort();
+
+        assert_eq!(ignored, 1);
+        assert_eq!(
+            urls,
+            vec![
+                format!("{base}/page-1"),
+                format!("{base}/page-2"),
+                format!("{base}/page-3"),
+            ]
+        );
+    }
 }

@@ -116,3 +116,100 @@ pub fn report_markdown(reports: &[RouteReport]) -> Result<String> {
 
     Ok(md)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, SeoData,
+        TaskMap, WebVitalsSnapshot,
+    };
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_report_markdown_full_mode_with_status() {
+        let mut categories = HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(0.91),
+                title: None,
+                key: None,
+            },
+        );
+        categories.insert(
+            "accessibility".to_string(),
+            LighthouseCategoryScore {
+                score: Some(1.0),
+                title: None,
+                key: None,
+            },
+        );
+
+        let r = RouteReport {
+            report_id: "1".to_string(),
+            route: NormalisedRoute {
+                id: "1".to_string(),
+                path: "/home".to_string(),
+                url: "https://example.com/home".to_string(),
+                definition: RouteDefinition {
+                    name: "/home".to_string(),
+                    path: "/home".to_string(),
+                },
+            },
+            artifact_path: "/tmp/1".to_string(),
+            artifact_url: "/1/".to_string(),
+            tasks: TaskMap::default(),
+            report: Some(LighthouseReport {
+                score: 0.955,
+                categories,
+                audits: serde_json::Value::Null,
+            }),
+            seo: Some(SeoData {
+                status_code: Some(301),
+                redirect_to: Some("https://example.com/".to_string()),
+                ..Default::default()
+            }),
+            web_vitals: None,
+        };
+
+        let md = report_markdown(&[r]).unwrap();
+        assert!(md.contains("# Unlighthouse Report"));
+        assert!(md.contains("| Path | Score | Performance | Accessibility | Best Practices | SEO | PWA | Status |"));
+        assert!(md.contains("| `/home` | **96** | 91 | 100 | - | - | - | 301 → https://example.com/ |"));
+    }
+
+    #[test]
+    fn test_report_markdown_fast_mode_web_vitals() {
+        let r = RouteReport {
+            report_id: "2".to_string(),
+            route: NormalisedRoute {
+                id: "2".to_string(),
+                path: "/fast".to_string(),
+                url: "https://example.com/fast".to_string(),
+                definition: RouteDefinition {
+                    name: "/fast".to_string(),
+                    path: "/fast".to_string(),
+                },
+            },
+            artifact_path: "/tmp/2".to_string(),
+            artifact_url: "/2/".to_string(),
+            tasks: TaskMap::default(),
+            report: None,
+            seo: None,
+            web_vitals: Some(WebVitalsSnapshot {
+                fcp: Some(800.0),
+                lcp: Some(1500.0),
+                cls: Some(0.025),
+                ttfb: Some(110.0),
+                tbt: Some(15.0),
+                score: 0.97,
+            }),
+        };
+
+        let md = report_markdown(&[r]).unwrap();
+        assert!(md.contains("| Path | Score | FCP (ms) | LCP (ms) | CLS | TTFB (ms) | TBT (ms) |"));
+        assert!(md.contains("| `/fast` | **97** | 800 | 1500 | 0.025 | 110 | 15 |"));
+        assert!(md.contains("PerformanceObserver API"));
+    }
+}

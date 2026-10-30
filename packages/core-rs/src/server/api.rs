@@ -116,10 +116,10 @@ fn normalise_crux_history(record: CruxRecord) -> serde_json::Value {
 
     let start = *indexes.iter().min().unwrap();
 
-    // Find the last index that has a meaningful value in any series.
-    let cls_end = cls.iter().rposition(|p| p.value >= 0.0).unwrap_or(0);
-    let lcp_end = lcp.iter().rposition(|p| p.value > 0.0).unwrap_or(0);
-    let inp_end = inp.iter().rposition(|p| p.value > 0.0).unwrap_or(0);
+    // Find the last index that has a meaningful value in any series (exclusive upper bound = idx + 1).
+    let cls_end = cls.iter().rposition(|p| p.value >= 0.0).map(|i| i + 1).unwrap_or(0);
+    let lcp_end = lcp.iter().rposition(|p| p.value > 0.0).map(|i| i + 1).unwrap_or(0);
+    let inp_end = inp.iter().rposition(|p| p.value > 0.0).map(|i| i + 1).unwrap_or(0);
     let end = [cls_end, lcp_end, inp_end].iter().copied().max().unwrap_or(0);
 
     // Guard against degenerate data that would cause a slice panic.
@@ -474,4 +474,286 @@ pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {
         monitor,
     });
     super::websocket::broadcast(&state.ws_tx, &meta_event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::types::{
+        LighthouseCategoryScore, LighthouseReport, NormalisedRoute, RouteDefinition, RouteReport,
+        TaskMap,
+    };
+    use axum::{
+        body::to_bytes,
+        routing::{get, post},
+        Router,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    async fn test_app_state() -> (Arc<AppState>, tokio::sync::mpsc::Receiver<NormalisedRoute>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("api_test.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        crate::db::insert_run(&db, "run-1", "https://example.com", "full")
+            .await
+            .unwrap();
+
+        let config = Arc::new(Config {
+            site: "https://example.com".to_string(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            workers: 2,
+            ..Default::default()
+        });
+        let (work_tx, work_rx) = tokio::sync::mpsc::channel(32);
+        let state = Arc::new(AppState::new(
+            config,
+            work_tx,
+            None,
+            db,
+            "run-1".to_string(),
+        ));
+        (state, work_rx, dir)
+    }
+
+    fn make_report(id: &str, path: &str, score: f64, done: bool) -> RouteReport {
+        let mut categories = HashMap::new();
+        categories.insert(
+            "performance".to_string(),
+            LighthouseCategoryScore {
+                score: Some(score),
+                title: None,
+                key: None,
+            },
+        );
+        RouteReport {
+            report_id: id.to_string(),
+            route: NormalisedRoute {
+                id: id.to_string(),
+                path: path.to_string(),
+                url: format!("https://example.com{path}"),
+                definition: RouteDefinition {
+                    name: path.to_string(),
+                    path: path.to_string(),
+                },
+            },
+            artifact_path: format!("/tmp/{id}"),
+            artifact_url: format!("/{id}/"),
+            tasks: TaskMap {
+                inspect_html_task: TaskStatus::Completed,
+                run_lighthouse_task: if done {
+                    TaskStatus::Completed
+                } else {
+                    TaskStatus::InProgress
+                },
+            },
+            report: Some(LighthouseReport {
+                score,
+                categories,
+                audits: serde_json::Value::Null,
+            }),
+            seo: None,
+            web_vitals: None,
+        }
+    }
+
+    #[test]
+    fn test_normalise_crux_history_includes_last_period() {
+        let raw_json = json!({
+            "record": {
+                "collectionPeriods": [
+                    { "firstDate": { "year": 2026, "month": 10, "day": 1 } },
+                    { "firstDate": { "year": 2026, "month": 10, "day": 8 } }
+                ],
+                "metrics": {
+                    "largest_contentful_paint": {
+                        "percentilesTimeseries": { "p75s": [1800.0, 1750.0] }
+                    },
+                    "cumulative_layout_shift": {
+                        "percentilesTimeseries": { "p75s": [0.05, 0.04] }
+                    }
+                }
+            }
+        });
+
+        let parsed: CruxHistoryResponse = serde_json::from_value(raw_json).unwrap();
+        let norm = normalise_crux_history(parsed.record);
+        let dates = norm["dates"].as_array().unwrap();
+        assert_eq!(dates.len(), 2);
+        let lcp = norm["lcp"].as_array().unwrap();
+        assert_eq!(lcp.len(), 2);
+        assert_eq!(lcp[0]["value"], 1800.0);
+        assert_eq!(lcp[1]["value"], 1750.0);
+        assert!(norm["inp"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_api_endpoints_reports_meta_rescan_and_history() {
+        let (state, mut work_rx, _dir) = test_app_state().await;
+
+        let r1 = make_report("id1", "/", 0.90, true);
+        let r2 = make_report("id2", "/about", 0.80, false);
+
+        {
+            let mut map = state.route_reports.write().await;
+            map.insert("id1".to_string(), r1.clone());
+            map.insert("id2".to_string(), r2.clone());
+        }
+
+        // Persist r1 and finish run so history endpoints return data
+        crate::db::insert_route_score(&state.db, "run-1", &r1)
+            .await
+            .unwrap();
+        crate::db::finish_run(&state.db, "run-1", 2).await.unwrap();
+
+        let router = Router::new()
+            .route("/api/reports", get(get_reports))
+            .route("/api/scan-meta", get(get_scan_meta))
+            .route("/api/reports/rescan", post(rescan_all))
+            .route("/api/reports/:id/rescan", post(rescan_one))
+            .route("/api/crux/*site", get(get_crux_history))
+            .route("/api/runs", get(list_runs))
+            .route("/api/runs/:run_id/scores", get(get_run_scores))
+            .route("/api/history/route", get(get_route_history))
+            .with_state(Arc::clone(&state));
+
+        // 1. GET /api/reports
+        let resp = router
+            .clone()
+            .oneshot(axum::http::Request::builder().uri("/api/reports").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let reports_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reports_json.as_array().unwrap().len(), 2);
+
+        // 2. GET /api/scan-meta
+        let resp = router
+            .clone()
+            .oneshot(axum::http::Request::builder().uri("/api/scan-meta").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let meta_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta_json["routes"], 2);
+        assert!((meta_json["score"].as_f64().unwrap() - 0.85).abs() < 1e-6);
+        assert_eq!(meta_json["monitor"]["doneTargets"], 1);
+        assert_eq!(meta_json["monitor"]["allTargets"], 2);
+
+        // 3. GET /api/runs, /api/runs/run-1/scores, /api/history/route
+        let resp = router
+            .clone()
+            .oneshot(axum::http::Request::builder().uri("/api/runs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/runs/run-1/scores")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let scores_val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(scores_val.as_array().unwrap().len(), 1);
+
+        // Missing ?path= parameter -> 400 Bad Request
+        let resp_bad = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/history/route")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_bad.status(), StatusCode::BAD_REQUEST);
+
+        // Valid ?path=/ parameter -> 200 OK with trend point
+        let resp_ok = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/history/route?path=/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+        let body = to_bytes(resp_ok.into_body(), usize::MAX).await.unwrap();
+        let trend_val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(trend_val.as_array().unwrap().len(), 1);
+
+        // 4. GET /api/crux/https:/example.com/history without token -> {"exists":false}
+        let resp_crux = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/crux/https:/example.com/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_crux.status(), StatusCode::OK);
+        let body = to_bytes(resp_crux.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], br#"{"exists":false}"#);
+
+        // 5. POST /api/reports/id1/rescan (200 OK) and unknown ID (404)
+        let resp_rescan_one = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/reports/id1/rescan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rescan_one.status(), StatusCode::OK);
+        let requeued = work_rx.try_recv().unwrap();
+        assert_eq!(requeued.id, "id1");
+
+        let resp_404 = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/reports/nonexistent/rescan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_404.status(), StatusCode::NOT_FOUND);
+
+        // 6. POST /api/reports/rescan clears remaining reports and re-queues them
+        let resp_rescan_all = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/reports/rescan")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_rescan_all.status(), StatusCode::OK);
+        let requeued2 = work_rx.try_recv().unwrap();
+        assert_eq!(requeued2.id, "id2");
+        assert!(state.route_reports.read().await.is_empty());
+    }
 }
