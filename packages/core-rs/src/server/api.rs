@@ -488,7 +488,12 @@ pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {
     let total = reports.len();
     let scores: Vec<f64> = reports
         .values()
-        .filter_map(|r| r.report.as_ref().map(|rep| rep.score))
+        .filter_map(|r| {
+            r.report
+                .as_ref()
+                .map(|rep| rep.score)
+                .or_else(|| r.web_vitals.as_ref().map(|wv| wv.score))
+        })
         .collect();
     let monitor = build_monitor_stats(state, &reports);
     drop(reports);
@@ -505,6 +510,133 @@ pub async fn broadcast_and_update(state: &Arc<AppState>, event: WsEvent) {
         monitor,
     });
     super::websocket::broadcast(&state.ws_tx, &meta_event);
+}
+
+#[derive(serde::Deserialize)]
+pub struct EnqueueRequest {
+    pub url: Option<String>,
+    pub path: Option<String>,
+}
+
+/// Enqueue a new or existing route by path or same-origin URL, invalidating any cached report.
+pub async fn enqueue_route_target(
+    state: &Arc<AppState>,
+    target: &str,
+) -> Result<crate::types::NormalisedRoute, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err("Target url or path must not be empty".to_string());
+    }
+    if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && !crate::util::is_same_origin(&state.config.site, trimmed)
+    {
+        return Err(format!(
+            "Target URL '{trimmed}' does not belong to site origin '{}'",
+            state.config.site
+        ));
+    }
+
+    let route = crate::discovery::routes::normalise_route(trimmed, &state.config.site);
+    let report = crate::queue::worker::create_route_report(&route, &state.config);
+    let cached_report = std::path::PathBuf::from(&report.artifact_path).join("report.json");
+    let _ = tokio::fs::remove_file(cached_report).await;
+
+    state
+        .route_reports
+        .write()
+        .await
+        .insert(route.id.clone(), report);
+    let _ = state.work_tx.send(route.clone()).await;
+    Ok(route)
+}
+
+/// POST /api/reports/enqueue — dynamically enqueue a route by `path` or `url`
+pub async fn enqueue_route(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EnqueueRequest>,
+) -> Response {
+    let target = req.url.or(req.path).unwrap_or_default();
+    match enqueue_route_target(&state, &target).await {
+        Ok(route) => Json(serde_json::json!({ "queued": true, "route": route })).into_response(),
+        Err(msg) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response(),
+    }
+}
+
+/// Evaluate global (`ci.budget`) and per-route (`config.budgets`) budget rules against current reports.
+pub async fn evaluate_budgets(state: &Arc<AppState>) -> serde_json::Value {
+    let reports = state.route_reports.read().await;
+    let scores_pct: Vec<f64> = reports
+        .values()
+        .filter_map(|r| {
+            r.report
+                .as_ref()
+                .map(|rep| rep.score * 100.0)
+                .or_else(|| r.web_vitals.as_ref().map(|wv| wv.score * 100.0))
+        })
+        .collect();
+
+    let avg_score = if scores_pct.is_empty() {
+        None
+    } else {
+        Some(scores_pct.iter().sum::<f64>() / scores_pct.len() as f64)
+    };
+
+    let global_budget = state.config.ci.budget;
+    let global_passed = match (global_budget, avg_score) {
+        (Some(budget), Some(avg)) => avg >= budget,
+        _ => true,
+    };
+
+    let mut violations = Vec::new();
+    for report in reports.values() {
+        let rule = state.config.budgets.iter().find(|r| {
+            glob::Pattern::new(&r.path)
+                .map(|p| p.matches(&report.route.path))
+                .unwrap_or(false)
+        });
+        let Some(rule) = rule else { continue };
+
+        if let Some(ref lh) = report.report {
+            for v in rule.violations(&lh.categories, lh.score) {
+                violations.push(serde_json::json!({
+                    "path": report.route.path,
+                    "category": v.label,
+                    "actual": v.actual,
+                    "threshold": v.threshold,
+                }));
+            }
+        } else if let Some(ref wv) = report.web_vitals {
+            if let Some(t) = rule.score {
+                let actual = wv.score * 100.0;
+                if actual < t {
+                    violations.push(serde_json::json!({
+                        "path": report.route.path,
+                        "category": "overall",
+                        "actual": actual,
+                        "threshold": t,
+                    }));
+                }
+            }
+        }
+    }
+
+    let passed = global_passed && violations.is_empty();
+    serde_json::json!({
+        "passed": passed,
+        "globalBudget": global_budget,
+        "averageScore": avg_score,
+        "globalPassed": global_passed,
+        "violations": violations,
+    })
+}
+
+/// GET /api/budgets — return global and per-route budget compliance status
+pub async fn get_budgets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(evaluate_budgets(&state).await)
 }
 
 #[cfg(test)]
@@ -642,6 +774,8 @@ mod tests {
         let router = Router::new()
             .route("/api/reports", get(get_reports))
             .route("/api/scan-meta", get(get_scan_meta))
+            .route("/api/budgets", get(get_budgets))
+            .route("/api/reports/enqueue", post(enqueue_route))
             .route("/api/reports/rescan", post(rescan_all))
             .route("/api/reports/:id/rescan", post(rescan_one))
             .route("/api/crux/*site", get(get_crux_history))
@@ -773,6 +907,7 @@ mod tests {
 
         // 6. POST /api/reports/rescan clears remaining reports and re-queues them
         let resp_rescan_all = router
+            .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
@@ -786,5 +921,36 @@ mod tests {
         let requeued2 = work_rx.try_recv().unwrap();
         assert_eq!(requeued2.id, "id2");
         assert!(state.route_reports.read().await.is_empty());
+
+        // 7. POST /api/reports/enqueue & GET /api/budgets
+        let enqueue_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/reports/enqueue")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":"/contact"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(enqueue_resp.status(), StatusCode::OK);
+        let enqueued = work_rx.try_recv().unwrap();
+        assert_eq!(enqueued.path, "/contact");
+
+        let budgets_resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/budgets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(budgets_resp.status(), StatusCode::OK);
+        let body = to_bytes(budgets_resp.into_body(), usize::MAX).await.unwrap();
+        let budgets_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(budgets_json["passed"], true);
     }
 }

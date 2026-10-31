@@ -41,7 +41,7 @@ pub fn fetch_sitemap_urls<'a>(
             return Ok(vec![]);
         }
 
-        let body = match resp.text().await {
+        let raw_bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
                 warn!("Sitemap body read error for {sitemap_url}: {e}");
@@ -49,13 +49,35 @@ pub fn fetch_sitemap_urls<'a>(
             }
         };
 
-        // TXT sitemap: one URL per line
-        if sitemap_url.ends_with(".txt") {
+        // Transparently decompress .gz sitemaps (or payloads starting with gzip magic bytes 0x1f 0x8b)
+        let body = if sitemap_url.ends_with(".gz") || raw_bytes.starts_with(&[0x1f, 0x8b]) {
+            use std::io::Read;
+            let mut decoder = flate2::read::GzDecoder::new(&raw_bytes[..]);
+            let mut decompressed = String::new();
+            match decoder.read_to_string(&mut decompressed) {
+                Ok(_) => decompressed,
+                Err(e) => {
+                    warn!("Failed to decompress gzipped sitemap {sitemap_url}: {e}");
+                    return Ok(vec![]);
+                }
+            }
+        } else {
+            String::from_utf8_lossy(&raw_bytes).into_owned()
+        };
+
+        // TXT sitemap: one URL per line (including .txt.gz)
+        if sitemap_url.ends_with(".txt") || sitemap_url.ends_with(".txt.gz") {
             let urls: Vec<String> = body
                 .lines()
                 .map(str::trim)
                 .filter(|l| l.starts_with("http") || l.starts_with('/'))
-                .map(String::from)
+                .map(|l| {
+                    if l.starts_with('/') {
+                        crate::util::resolve_url(site, l).unwrap_or_else(|| l.to_string())
+                    } else {
+                        l.to_string()
+                    }
+                })
                 .collect();
             debug!("TXT sitemap {sitemap_url}: {} URLs", urls.len());
             return Ok(urls);
@@ -87,7 +109,7 @@ async fn parse_sitemap_xml(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
-                match e.name().as_ref() {
+                match e.local_name().as_ref() {
                     b"sitemapindex" => in_sitemap_index = true,
                     b"loc" => {
                         if in_sitemap_index {
@@ -109,8 +131,18 @@ async fn parse_sitemap_xml(
                     in_sitemap_loc = false;
                 }
             }
+            Ok(Event::CData(ref e)) => {
+                let text = String::from_utf8_lossy(e.as_ref()).trim().to_string();
+                if in_url_loc && !text.is_empty() {
+                    urls.push(text);
+                    in_url_loc = false;
+                } else if in_sitemap_loc && !text.is_empty() {
+                    sub_sitemaps.push(text);
+                    in_sitemap_loc = false;
+                }
+            }
             Ok(Event::End(ref e)) => {
-                if e.name().as_ref() == b"loc" {
+                if e.local_name().as_ref() == b"loc" {
                     in_url_loc = false;
                     in_sitemap_loc = false;
                 }
@@ -125,11 +157,25 @@ async fn parse_sitemap_xml(
         buf.clear();
     }
 
+    // Resolve any relative URLs against `site`
+    for u in &mut urls {
+        if u.starts_with('/') {
+            if let Some(resolved) = crate::util::resolve_url(site, u) {
+                *u = resolved;
+            }
+        }
+    }
+
     // Recursively fetch sub-sitemaps (Box::pin handles the recursive async call)
     for sub_url in sub_sitemaps {
-        match fetch_sitemap_urls(client, &sub_url, site, depth + 1).await {
+        let resolved_sub = if sub_url.starts_with('/') {
+            crate::util::resolve_url(site, &sub_url).unwrap_or(sub_url)
+        } else {
+            sub_url
+        };
+        match fetch_sitemap_urls(client, &resolved_sub, site, depth + 1).await {
             Ok(sub_urls) => urls.extend(sub_urls),
-            Err(e) => warn!("Failed to fetch sub-sitemap {sub_url}: {e}"),
+            Err(e) => warn!("Failed to fetch sub-sitemap {resolved_sub}: {e}"),
         }
     }
 
@@ -195,9 +241,11 @@ mod tests {
     async fn test_parse_sitemap_xml_urlset_and_entities() {
         let client = reqwest::Client::new();
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:sitemap="http://www.sitemaps.org/schemas/sitemap/0.9">
             <url><loc>https://example.com/</loc></url>
             <url><loc>https://example.com/search?a=1&amp;b=2</loc></url>
+            <url><sitemap:loc><![CDATA[https://example.com/cdata-page]]></sitemap:loc></url>
+            <url><loc>/relative-page</loc></url>
         </urlset>"#;
 
         let urls = parse_sitemap_xml(&client, xml, "https://example.com", 0)
@@ -207,7 +255,9 @@ mod tests {
             urls,
             vec![
                 "https://example.com/".to_string(),
-                "https://example.com/search?a=1&b=2".to_string()
+                "https://example.com/search?a=1&b=2".to_string(),
+                "https://example.com/cdata-page".to_string(),
+                "https://example.com/relative-page".to_string(),
             ]
         );
     }
@@ -243,6 +293,7 @@ mod tests {
                         r#"<sitemapindex>
                             <sitemap><loc>{base}/sub.xml</loc></sitemap>
                             <sitemap><loc>{base}/list.txt</loc></sitemap>
+                            <sitemap><loc>/compressed.xml.gz</loc></sitemap>
                         </sitemapindex>"#
                     )
                 }),
@@ -261,7 +312,18 @@ mod tests {
             .route(
                 "/list.txt",
                 get(|State(base): State<String>| async move {
-                    format!("{base}/page-2\n# comment line\n{base}/page-3\n")
+                    format!("{base}/page-2\n# comment line\n/page-3\n")
+                }),
+            )
+            .route(
+                "/compressed.xml.gz",
+                get(|State(base): State<String>| async move {
+                    use std::io::Write;
+                    let xml = format!(r#"<urlset><url><loc>{base}/page-gz</loc></url></urlset>"#);
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    encoder.write_all(xml.as_bytes()).unwrap();
+                    encoder.finish().unwrap()
                 }),
             )
             .with_state(base.clone());
@@ -284,6 +346,7 @@ mod tests {
                 format!("{base}/page-1"),
                 format!("{base}/page-2"),
                 format!("{base}/page-3"),
+                format!("{base}/page-gz"),
             ]
         );
     }

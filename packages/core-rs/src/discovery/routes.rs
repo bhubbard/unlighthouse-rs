@@ -12,18 +12,25 @@ use crate::util::{is_html_path, is_same_origin, resolve_url, url_origin, url_to_
 
 /// Normalise a URL into a NormalisedRoute.
 pub fn normalise_route(url: &str, site: &str) -> NormalisedRoute {
-    let id = url_to_id(url);
-    let path = url_to_path(url);
+    // Strip URL fragment (#...) so anchor links on the same page don't create duplicate routes
+    let url_no_frag = url.split('#').next().unwrap_or(url);
+    let path = url_to_path(url_no_frag);
     let definition = RouteDefinition {
         name: path.clone(),
         path: path.clone(),
     };
-    // Make the URL absolute if it isn't already
-    let abs_url = if url.starts_with("http") {
-        url.to_string()
+    // Make the URL absolute if it isn't already, and ensure bare origin URLs end with '/'
+    let mut abs_url = if url_no_frag.starts_with("http") {
+        url_no_frag.to_string()
+    } else if url_no_frag.starts_with('/') {
+        format!("{}{}", site.trim_end_matches('/'), url_no_frag)
     } else {
-        format!("{}{}", site.trim_end_matches('/'), url)
+        format!("{}/{}", site.trim_end_matches('/'), url_no_frag)
     };
+    if path == "/" && !abs_url.ends_with('/') && !abs_url.contains('?') {
+        abs_url.push('/');
+    }
+    let id = url_to_id(&abs_url);
     NormalisedRoute {
         id,
         path,
@@ -186,7 +193,8 @@ pub async fn resolve_reportable_routes(
         }
     }
 
-    // ── Build initial route list ───────────────────────────────────────────────
+    // ── Build initial route list (deduplicated by canonical route ID) ─────────
+    let mut seen_ids: HashSet<String> = HashSet::new();
     let mut routes: Vec<NormalisedRoute> = urls
         .iter()
         .filter(|u| is_same_origin(&site_origin, u))
@@ -196,6 +204,7 @@ pub async fn resolve_reportable_routes(
         })
         .filter(|u| is_html_path(&url_to_path(u)))
         .map(|u| normalise_route(u, &site_origin))
+        .filter(|r| seen_ids.insert(r.id.clone()))
         .collect();
 
     // ── robots.txt filtering ─────────────────────────────────────────────────
@@ -325,6 +334,16 @@ mod tests {
         let r2 = normalise_route("https://example.com/pricing?plan=pro", "https://example.com");
         assert_eq!(r2.path, "/pricing");
         assert_eq!(r2.url, "https://example.com/pricing?plan=pro");
+
+        // Bare origin, trailing slash, relative "/", and "#fragment" all canonicalize to the same route ID
+        let root_bare = normalise_route("https://example.com", "https://example.com");
+        let root_slash = normalise_route("https://example.com/", "https://example.com");
+        let root_rel = normalise_route("/", "https://example.com");
+        let root_frag = normalise_route("/#top", "https://example.com");
+        assert_eq!(root_bare.id, root_slash.id);
+        assert_eq!(root_slash.id, root_rel.id);
+        assert_eq!(root_rel.id, root_frag.id);
+        assert_eq!(root_bare.url, "https://example.com/");
     }
 
     #[test]

@@ -99,6 +99,20 @@ pub async fn handle_mcp_request(state: &Arc<AppState>, request: &Value) -> Value
                             "rescan_all": {
                                 "description": "Clear all current reports and re-queue all routes for scanning",
                                 "inputSchema": { "type": "object", "properties": {} }
+                            },
+                            "audit_url": {
+                                "description": "Dynamically enqueue a new or existing route path or same-origin URL for auditing",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "url": { "type": "string", "description": "Route path (e.g. '/pricing') or full same-origin URL to audit" }
+                                    },
+                                    "required": ["url"]
+                                }
+                            },
+                            "check_budgets": {
+                                "description": "Evaluate global and per-route score budgets against current scan reports",
+                                "inputSchema": { "type": "object", "properties": {} }
                             }
                         }
                     },
@@ -172,6 +186,22 @@ pub async fn handle_mcp_request(state: &Arc<AppState>, request: &Value) -> Value
                         {
                             "name": "rescan_all",
                             "description": "Clear all current reports and re-queue all routes for scanning",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "audit_url",
+                            "description": "Dynamically enqueue a new or existing route path or same-origin URL for auditing",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "url": { "type": "string", "description": "Route path (e.g. '/pricing') or full same-origin URL to audit" }
+                                },
+                                "required": ["url"]
+                            }
+                        },
+                        {
+                            "name": "check_budgets",
+                            "description": "Evaluate global and per-route score budgets against current scan reports",
                             "inputSchema": { "type": "object", "properties": {} }
                         }
                     ]
@@ -300,16 +330,48 @@ pub async fn handle_mcp_request(state: &Arc<AppState>, request: &Value) -> Value
                     "rescan_all" => {
                         let mut reports = state.route_reports.write().await;
                         let count = reports.len();
-                        let routes: Vec<_> = reports.values().map(|r| r.route.clone()).collect();
+                        let items: Vec<_> = reports
+                            .values()
+                            .map(|r| (r.route.clone(), r.artifact_path.clone()))
+                            .collect();
                         reports.clear();
                         drop(reports);
-                        for route in routes {
+                        for (route, artifact_path) in items {
+                            let cached_report = std::path::PathBuf::from(&artifact_path).join("report.json");
+                            let _ = tokio::fs::remove_file(cached_report).await;
                             let _ = state.work_tx.send(route).await;
                         }
                         json!({
                             "jsonrpc": "2.0",
                             "id": id,
                             "result": { "content": [{ "type": "text", "text": format!("Successfully cleared and queued all {} routes for rescan", count) }] }
+                        })
+                    },
+                    "audit_url" => {
+                        let target = arguments
+                            .get("url")
+                            .or_else(|| arguments.get("path"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match super::api::enqueue_route_target(state, target).await {
+                            Ok(route) => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": { "content": [{ "type": "text", "text": serde_json::to_string_pretty(&route).unwrap() }] }
+                            }),
+                            Err(msg) => json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": { "code": -32602, "message": msg }
+                            }),
+                        }
+                    },
+                    "check_budgets" => {
+                        let result = super::api::evaluate_budgets(state).await;
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": { "content": [{ "type": "text", "text": serde_json::to_string_pretty(&result).unwrap() }] }
                         })
                     },
                     _ => json!({
@@ -415,7 +477,7 @@ mod tests {
             &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
         )
         .await;
-        assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 9);
 
         // 3. tools/call -> list_reports
         let lr_resp = handle_mcp_request(
@@ -532,6 +594,50 @@ mod tests {
         .await;
         assert!(rescan_all_resp["result"].is_object());
         assert_eq!(work_rx.try_recv().unwrap().path, "/about");
+
+        // 6.5 tools/call -> audit_url & check_budgets
+        let audit_ok = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "tools/call",
+                "params": { "name": "audit_url", "arguments": { "url": "/pricing" } }
+            }),
+        )
+        .await;
+        assert!(audit_ok["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("/pricing"));
+        assert_eq!(work_rx.try_recv().unwrap().path, "/pricing");
+
+        let audit_cross_origin = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": { "name": "audit_url", "arguments": { "url": "https://evil.org/phish" } }
+            }),
+        )
+        .await;
+        assert_eq!(audit_cross_origin["error"]["code"], -32602);
+
+        let budget_resp = handle_mcp_request(
+            &state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 102,
+                "method": "tools/call",
+                "params": { "name": "check_budgets", "arguments": {} }
+            }),
+        )
+        .await;
+        assert!(budget_resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("\"passed\": true"));
 
         // 7. Unknown tool & unknown method
         let unk_tool = handle_mcp_request(

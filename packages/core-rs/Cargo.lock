@@ -3833,6 +3833,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "flate2",
  "futures",
  "glob",
  "headless_chrome",

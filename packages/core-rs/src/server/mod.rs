@@ -336,6 +336,8 @@ pub async fn start_server(
     let api_router = Router::new()
         .route("/api/reports", get(api::get_reports))
         .route("/api/scan-meta", get(api::get_scan_meta))
+        .route("/api/budgets", get(api::get_budgets))
+        .route("/api/reports/enqueue", post(api::enqueue_route))
         .route("/api/reports/rescan", post(api::rescan_all))
         .route("/api/reports/:id/rescan", post(api::rescan_one))
         .route("/api/crux/*site", get(api::get_crux_history))
