@@ -65,16 +65,21 @@ pub fn parse_robots_txt(content: &str) -> ParsedRobotsTxt {
         disallow.clear();
     };
 
-    for line in content.lines() {
+    for raw_line in content.lines() {
+        // Strip inline and full-line '#' comments per RFC 9309 Section 2.1
+        let line = raw_line.split('#').next().unwrap_or(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
         let sep = match line.find(':') {
             Some(i) => i,
             None => continue,
         };
-        let rule = line[..sep].trim();
+        let rule = line[..sep].trim().to_ascii_lowercase();
         let val = line[sep + 1..].trim().to_string();
 
-        match rule {
-            "User-agent" => {
+        match rule.as_str() {
+            "user-agent" => {
                 if create_new_group {
                     flush_group(
                         &mut current_user_agents,
@@ -87,18 +92,18 @@ pub fn parse_robots_txt(content: &str) -> ParsedRobotsTxt {
                 }
                 current_user_agents.push(val);
             }
-            "Allow" => {
+            "allow" => {
                 current_allow.push(val);
                 create_new_group = true;
             }
-            "Disallow" => {
+            "disallow" => {
                 current_disallow.push(val);
                 create_new_group = true;
             }
-            "Sitemap" => {
+            "sitemap" => {
                 sitemaps.push(val);
             }
-            "Host" => {
+            "host" => {
                 current_host = Some(val);
             }
             _ => {}
@@ -179,19 +184,19 @@ pub fn match_path_to_rule<'a>(path: &str, rules: &'a [RobotsRule]) -> Option<&'a
     best
 }
 
-/// Collect all disallow rules from groups that apply to Googlebot (or `*`).
+/// Collect all rules (`Disallow` and `Allow`) from groups that apply to Googlebot,
+/// `unlighthouse`, or `*`, preserving order so `match_path_to_rule` can apply
+/// RFC 9309 longest-match-wins (with `Allow` breaking ties).
 pub fn collect_disallow_rules(parsed: &ParsedRobotsTxt) -> Vec<RobotsRule> {
     let mut rules = Vec::new();
     for group in &parsed.groups {
-        let applies = group.user_agent.iter().any(|ua| ua == "*" || ua.to_lowercase().contains("googlebot"));
+        let applies = group.user_agent.iter().any(|ua| {
+            let lower = ua.to_ascii_lowercase();
+            ua == "*" || lower.contains("googlebot") || lower.contains("unlighthouse")
+        });
         if applies {
             for rule in &group.rules {
-                if !rule.allow {
-                    rules.push(RobotsRule {
-                        pattern: rule.pattern.clone(),
-                        allow: false,
-                    });
-                }
+                rules.push(rule.clone());
             }
         }
     }
@@ -228,5 +233,28 @@ mod tests {
         ];
         let rule = match_path_to_rule("/allowed/page", &rules).unwrap();
         assert!(rule.allow);
+    }
+
+    #[test]
+    fn test_case_insensitive_comments_and_allow_override() {
+        let txt = r#"
+# Full-line comment
+USER-AGENT: * # Applies to all crawlers
+disallow: /private/ # Block private dir
+allow: /private/public-doc # Except public doc
+sitemap: https://example.com/sitemap.xml # Trailing comment
+"#;
+        let parsed = parse_robots_txt(txt);
+        assert_eq!(parsed.sitemaps, vec!["https://example.com/sitemap.xml"]);
+        let rules = collect_disallow_rules(&parsed);
+        assert_eq!(rules.len(), 2);
+
+        // /private/secret is disallowed
+        let r_blocked = match_path_to_rule("/private/secret", &rules).unwrap();
+        assert!(!r_blocked.allow);
+
+        // /private/public-doc is allowed because the Allow pattern is longer
+        let r_allowed = match_path_to_rule("/private/public-doc", &rules).unwrap();
+        assert!(r_allowed.allow);
     }
 }

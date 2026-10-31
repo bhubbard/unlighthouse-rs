@@ -5,6 +5,28 @@ pub fn report_markdown(reports: &[RouteReport]) -> Result<String> {
     let mut md = String::new();
     md.push_str("# Unlighthouse Report\n\n");
 
+    let scores: Vec<f64> = reports
+        .iter()
+        .filter_map(|r| {
+            r.report
+                .as_ref()
+                .map(|rep| rep.score * 100.0)
+                .or_else(|| r.web_vitals.as_ref().map(|wv| wv.score * 100.0))
+        })
+        .collect();
+    if !reports.is_empty() {
+        let avg_str = if scores.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{:.0}", scores.iter().sum::<f64>() / scores.len() as f64)
+        };
+        md.push_str(&format!(
+            "**Routes scanned:** {} | **Average score:** {}\n\n",
+            reports.len(),
+            avg_str
+        ));
+    }
+
     // Detect whether any report has Web Vitals (fast mode) vs Lighthouse (full mode).
     let has_vitals  = reports.iter().any(|r| r.web_vitals.is_some());
     let has_lh      = reports.iter().any(|r| r.report.is_some());

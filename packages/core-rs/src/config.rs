@@ -13,6 +13,7 @@ pub enum ReporterType {
     JsonSimple,
     JsonExpanded,
     CsvSimple,
+    CsvExpanded,
     Markdown,
     Lhci,
 }
@@ -24,6 +25,7 @@ impl std::str::FromStr for ReporterType {
             "jsonSimple" | "json-simple" | "json" => Ok(Self::JsonSimple),
             "jsonExpanded" | "json-expanded" => Ok(Self::JsonExpanded),
             "csvSimple" | "csv-simple" | "csv" => Ok(Self::CsvSimple),
+            "csvExpanded" | "csv-expanded" => Ok(Self::CsvExpanded),
             "markdown" | "md" => Ok(Self::Markdown),
             "lhci" | "lhciServer" | "lhci-server" => Ok(Self::Lhci),
             "none" | "false" => Ok(Self::None),

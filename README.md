@@ -36,13 +36,14 @@ Everything else is Rust:
 |-----------|---------------|
 | CLI | `clap` |
 | Config (TOML / JSON) | `serde` + `toml` |
-| URL discovery (sitemap, robots.txt, crawler) | `reqwest` + `scraper` + `quick-xml` |
-| HTTP server + REST API | `axum` |
+| URL discovery (sitemap `.xml`/`.xml.gz`/`.txt`, `robots.txt`, crawler) | `reqwest` + `scraper` + `quick-xml` + `flate2` |
+| HTTP server + REST API + MCP server | `axum` + JSON-RPC 2.0 (`--mcp`) |
 | WebSocket broadcast | `axum` + `tokio::sync::broadcast` |
-| Job queue + concurrency | `tokio` + semaphore |
-| HTML inspection | `reqwest` + `scraper` (default), `headless_chrome`, or `chromiumoxide` |
-| CI reporters (JSON, CSV) | `serde_json` + `csv` |
-| GUI payload injection | Inline `<script>` injected into `index.html` at serve time |
+| Job queue + persistent worker pool | `tokio` + semaphore + self-healing IPC pool |
+| HTML inspection & native fast-mode Web Vitals | `reqwest` + `scraper` (default), `headless_chrome`, or `chromiumoxide` (`--feature chromiumoxide-backend`) |
+| Historical score trending | `sqlx` (SQLite) |
+| CI reporters (JSON, CSV, Markdown, LHCI) | `serde_json` + `csv` + Markdown + LHCI upload |
+| GUI & static dashboard export (`--build-static`) | `rust-embed` + inline `window.__unlighthouse_payload` injection |
 
 ---
 
@@ -125,29 +126,49 @@ Options:
       --throttle
           Enable network/CPU throttling in Lighthouse
       --samples <N>
-          Number of Lighthouse samples per URL
+          Number of Lighthouse samples per URL (selects median run)
+      --mode <MODE>
+          Audit mode: full (default, runs Lighthouse) | fast (native CDP Web Vitals)
       --reporter <FORMAT>
-          CI reporter format: json | csv | jsonExpanded | none
+          CI reporter format: json | jsonExpanded | csv | csvExpanded | markdown | lhci | none
       --budget <0-100>
           Exit with code 1 if average score is below this value
       --ci
           CI mode: no HTTP server, write report and exit
       --build-static
-          Build static output
+          Export a self-contained static client bundle into <output-path>/client/
+      --mcp
+          Start as a Model Context Protocol (MCP) JSON-RPC server over stdio
       --port <PORT>
-          HTTP server port [default: 5678]
+          HTTP server port [default: 5678] (automatically falls back if busy)
       --host <HOST>
           HTTP server host [default: localhost]
       --include <PATHS>
-          Paths to include (comma-separated)
+          Paths to include (comma-separated: prefix, glob, or /regex/)
       --exclude <PATHS>
-          Paths to exclude (comma-separated)
-      --config <FILE>
+          Paths to exclude (comma-separated: prefix, glob, or /regex/)
+      --skip-javascript
+          Disable JavaScript execution during audits
+      --warmup
+          Navigate to the URL before running Lighthouse
+      --block-assets
+          Block images/fonts to speed up the audit
+      --lhci-host <URL>
+          Lighthouse CI (LHCI) server host
+      --lhci-build-token <TOKEN>
+          LHCI server build token
+      --lhci-auth <USER:PASS>
+          LHCI server Basic Auth credentials
+      --crux-api-token <KEY>
+          Google CrUX History API key [env: CRUX_API_TOKEN]
+      --purge-runs-older-than-days <DAYS>
+          Purge SQLite historical runs older than N days [default: 30]
+  -c, --config <FILE>
           Path to config file (unlighthouse.config.toml or .json)
   -d, --debug
           Enable debug logging
       --no-cache
-          Disable caching
+          Disable on-disk report caching
   -h, --help
           Print help
   -V, --version
@@ -170,11 +191,18 @@ max_routes = 100
 device = "mobile"
 throttle = false
 dynamic_sampling = 5
+samples = 1
 
 [ci]
 enabled = false
 reporter = "json"
 budget = 80
+
+[[budgets]]
+path = "/checkout/**"
+performance = 90
+accessibility = 95
+seo = 90
 ```
 
 Or use `unlighthouse.config.json` if you prefer JSON.

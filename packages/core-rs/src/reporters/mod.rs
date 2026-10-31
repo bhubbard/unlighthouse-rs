@@ -37,18 +37,24 @@ pub async fn write_report(
     let out_dir = Path::new(&config.output_path);
     tokio::fs::create_dir_all(out_dir).await?;
 
+    let mut sorted_reports = reports.to_vec();
+    sorted_reports.sort_by(|a, b| a.route.path.cmp(&b.route.path));
+
     let (filename, content) = match reporter {
         ReporterType::CsvSimple => {
-            ("report.csv", csv::report_csv_simple(reports)?)
+            ("report.csv", csv::report_csv_simple(&sorted_reports)?)
+        }
+        ReporterType::CsvExpanded => {
+            ("report-expanded.csv", csv::report_csv_expanded(&sorted_reports)?)
         }
         ReporterType::JsonSimple => {
-            ("report.json", json::report_json_simple(reports)?)
+            ("report.json", json::report_json_simple(&sorted_reports)?)
         }
         ReporterType::JsonExpanded => {
-            ("report-expanded.json", json::report_json_expanded(reports)?)
+            ("report-expanded.json", json::report_json_expanded(&sorted_reports)?)
         }
         ReporterType::Markdown => {
-            ("report.md", markdown::report_markdown(reports)?)
+            ("report.md", markdown::report_markdown(&sorted_reports)?)
         }
         ReporterType::None | ReporterType::Lhci => unreachable!(),
     };
@@ -118,6 +124,12 @@ mod tests {
         let p_csv = write_report(&reports, &config).await.unwrap().unwrap();
         assert!(p_csv.ends_with("report.csv"));
         assert!(Path::new(&p_csv).exists());
+
+        // 4.5. CsvExpanded -> report-expanded.csv
+        config.ci.reporter = ReporterType::CsvExpanded;
+        let p_csv_exp = write_report(&reports, &config).await.unwrap().unwrap();
+        assert!(p_csv_exp.ends_with("report-expanded.csv"));
+        assert!(Path::new(&p_csv_exp).exists());
 
         // 5. Markdown -> report.md
         config.ci.reporter = ReporterType::Markdown;

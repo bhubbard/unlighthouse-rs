@@ -33,7 +33,13 @@ pub fn report_csv_simple(reports: &[RouteReport]) -> Result<String> {
             .report
             .as_ref()
             .map(|r| format!("{}", (r.score * 100.0).round() as i64))
-            .unwrap_or_else(|| "".to_string());
+            .or_else(|| {
+                report
+                    .web_vitals
+                    .as_ref()
+                    .map(|wv| format!("{}", (wv.score * 100.0).round() as i64))
+            })
+            .unwrap_or_default();
 
         let mut row = vec![path, score];
 
@@ -53,6 +59,153 @@ pub fn report_csv_simple(reports: &[RouteReport]) -> Result<String> {
             }
         }
 
+        rows.push(row.join(","));
+    }
+
+    Ok(rows.join("\n"))
+}
+
+/// Generate expanded CSV output including Lighthouse category scores, SEO metadata,
+/// HTTP status/redirects, and Core Web Vitals metrics.
+pub fn report_csv_expanded(reports: &[RouteReport]) -> Result<String> {
+    let mut rows: Vec<String> = Vec::new();
+
+    let mut category_keys: Vec<String> = reports
+        .iter()
+        .find_map(|r| {
+            r.report
+                .as_ref()
+                .map(|rep| rep.categories.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    category_keys.sort();
+
+    let mut header = vec!["URL".to_string(), "Score".to_string()];
+    for key in &category_keys {
+        header.push(key_to_title(key));
+    }
+    header.extend([
+        "Status".to_string(),
+        "Redirect".to_string(),
+        "Title".to_string(),
+        "Description".to_string(),
+        "Canonical".to_string(),
+        "HTML-Bytes".to_string(),
+        "Internal-Links".to_string(),
+        "External-Links".to_string(),
+        "FCP-ms".to_string(),
+        "LCP-ms".to_string(),
+        "CLS".to_string(),
+        "TTFB-ms".to_string(),
+        "TBT-ms".to_string(),
+    ]);
+    rows.push(header.join(","));
+
+    for report in reports {
+        let path = escape_csv(&report.route.path);
+        let score = report
+            .report
+            .as_ref()
+            .map(|r| format!("{}", (r.score * 100.0).round() as i64))
+            .or_else(|| {
+                report
+                    .web_vitals
+                    .as_ref()
+                    .map(|wv| format!("{}", (wv.score * 100.0).round() as i64))
+            })
+            .unwrap_or_default();
+
+        let mut row = vec![path, score];
+
+        if let Some(rep) = &report.report {
+            for key in &category_keys {
+                let cat_score = rep
+                    .categories
+                    .get(key)
+                    .and_then(|c| c.score)
+                    .map(|s| format!("{}", (s * 100.0).round() as i64))
+                    .unwrap_or_default();
+                row.push(cat_score);
+            }
+        } else {
+            for _ in &category_keys {
+                row.push(String::new());
+            }
+        }
+
+        let status = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.status_code)
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        let redirect = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.redirect_to.as_deref())
+            .map(escape_csv)
+            .unwrap_or_default();
+        let title = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.title.as_deref())
+            .map(escape_csv)
+            .unwrap_or_default();
+        let description = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.description.as_deref())
+            .map(escape_csv)
+            .unwrap_or_default();
+        let canonical = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.canonical_url.as_deref())
+            .map(escape_csv)
+            .unwrap_or_default();
+        let html_bytes = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.html_size)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let internal_links = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.internal_links)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let external_links = report
+            .seo
+            .as_ref()
+            .and_then(|s| s.external_links)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+
+        let fmt_ms = |v: Option<f64>| v.map(|x| format!("{x:.0}")).unwrap_or_default();
+        let fmt_cls = |v: Option<f64>| v.map(|x| format!("{x:.3}")).unwrap_or_default();
+
+        let fcp = fmt_ms(report.web_vitals.as_ref().and_then(|w| w.fcp));
+        let lcp = fmt_ms(report.web_vitals.as_ref().and_then(|w| w.lcp));
+        let cls = fmt_cls(report.web_vitals.as_ref().and_then(|w| w.cls));
+        let ttfb = fmt_ms(report.web_vitals.as_ref().and_then(|w| w.ttfb));
+        let tbt = fmt_ms(report.web_vitals.as_ref().and_then(|w| w.tbt));
+
+        row.extend([
+            status,
+            redirect,
+            title,
+            description,
+            canonical,
+            html_bytes,
+            internal_links,
+            external_links,
+            fcp,
+            lcp,
+            cls,
+            ttfb,
+            tbt,
+        ]);
         rows.push(row.join(","));
     }
 
@@ -151,11 +304,17 @@ mod tests {
             web_vitals: None,
         };
 
-        let csv_str = report_csv_simple(&[r1, r2]).unwrap();
+        let csv_str = report_csv_simple(&[r1.clone(), r2]).unwrap();
         let lines: Vec<&str> = csv_str.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "URL,Score,PERFORMANCE,SEO");
         assert_eq!(lines[1], "\"/\",91,92,89");
         assert_eq!(lines[2], "\"/missing\",,,");
+
+        let exp_str = report_csv_expanded(&[r1]).unwrap();
+        let exp_lines: Vec<&str> = exp_str.lines().collect();
+        assert_eq!(exp_lines.len(), 2);
+        assert!(exp_lines[0].starts_with("URL,Score,PERFORMANCE,SEO,Status,Redirect,Title"));
+        assert!(exp_lines[1].starts_with("\"/\",91,92,89,"));
     }
 }
