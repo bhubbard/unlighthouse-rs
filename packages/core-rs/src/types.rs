@@ -119,6 +119,44 @@ pub struct WebVitalsSnapshot {
     pub score: f64,
 }
 
+impl WebVitalsSnapshot {
+    /// Computes the Lighthouse v11-aligned weighted composite score (`0.0..=1.0`)
+    /// from FCP (10%), LCP (25%), TBT (30%), CLS (25%), and TTFB (10%) piecewise
+    /// linear threshold curves.
+    pub fn compute_weighted_score(&self) -> f64 {
+        fn metric_score(val: f64, good: f64, poor: f64) -> f64 {
+            if val <= good {
+                1.0 - 0.10 * (val / good.max(1e-6)).clamp(0.0, 1.0)
+            } else if val >= poor {
+                (0.49 * (poor / val.max(1e-6))).clamp(0.0, 0.49)
+            } else {
+                let t = (val - good) / (poor - good);
+                0.90 - 0.40 * t
+            }
+        }
+
+        let s_fcp = self
+            .fcp
+            .map(|v| metric_score(v, 1800.0, 3000.0))
+            .unwrap_or(0.90);
+        let s_lcp = self
+            .lcp
+            .map(|v| metric_score(v, 2500.0, 4000.0))
+            .unwrap_or(0.90);
+        let s_tbt = self
+            .tbt
+            .map(|v| metric_score(v, 200.0, 600.0))
+            .unwrap_or(0.90);
+        let s_cls = self.cls.map(|v| metric_score(v, 0.1, 0.25)).unwrap_or(0.95);
+        let s_ttfb = self
+            .ttfb
+            .map(|v| metric_score(v, 800.0, 1800.0))
+            .unwrap_or(0.90);
+
+        (0.10 * s_fcp + 0.25 * s_lcp + 0.30 * s_tbt + 0.25 * s_cls + 0.10 * s_ttfb).clamp(0.0, 1.0)
+    }
+}
+
 // ── Per-task status map ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -239,5 +277,18 @@ mod tests {
         assert_eq!(json["event"], "scan-meta-update");
         assert_eq!(json["data"]["routes"], 5);
         assert!((json["data"]["score"].as_f64().unwrap() - 0.92).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_web_vitals_weighted_score() {
+        let fast = WebVitalsSnapshot {
+            fcp: Some(900.0),
+            lcp: Some(1400.0),
+            cls: Some(0.01),
+            ttfb: Some(250.0),
+            tbt: Some(40.0),
+            score: 0.95,
+        };
+        assert!(fast.compute_weighted_score() >= 0.90);
     }
 }
