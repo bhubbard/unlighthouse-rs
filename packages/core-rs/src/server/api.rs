@@ -212,7 +212,20 @@ fn build_monitor_stats(
     
     let done = reports
         .values()
-        .filter(|r| r.tasks.run_lighthouse_task == TaskStatus::Completed)
+        .filter(|r| {
+            matches!(
+                r.tasks.run_lighthouse_task,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Ignore
+            )
+        })
+        .count();
+
+    let failed = reports
+        .values()
+        .filter(|r| {
+            r.tasks.run_lighthouse_task == TaskStatus::Failed
+                || r.tasks.inspect_html_task == TaskStatus::Failed
+        })
         .count();
 
     let all_done = done == total;
@@ -258,7 +271,7 @@ fn build_monitor_stats(
             "{:.0}",
             done as f64 * 100.0 / total as f64
         ),
-        error_perc: "0.00".to_string(),
+        error_perc: format!("{:.2}", failed as f64 * 100.0 / total as f64),
         time_running: elapsed,
         time_remaining,
         pages_per_second,
@@ -267,13 +280,18 @@ fn build_monitor_stats(
     })
 }
 
-/// GET /api/scan-meta — return current scan statistics
-pub async fn get_scan_meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+/// Compute the current [`ScanMeta`] snapshot across all routes (supports both full and fast modes).
+pub async fn compute_scan_meta(state: &Arc<AppState>) -> ScanMeta {
     let reports = state.route_reports.read().await;
     let total = reports.len();
     let scores: Vec<f64> = reports
         .values()
-        .filter_map(|r| r.report.as_ref().map(|rep| rep.score))
+        .filter_map(|r| {
+            r.report
+                .as_ref()
+                .map(|rep| rep.score)
+                .or_else(|| r.web_vitals.as_ref().map(|wv| wv.score))
+        })
         .collect();
     let avg_score = if scores.is_empty() {
         0.0
@@ -281,14 +299,19 @@ pub async fn get_scan_meta(State(state): State<Arc<AppState>>) -> impl IntoRespo
         scores.iter().sum::<f64>() / scores.len() as f64
     };
 
-    let monitor = build_monitor_stats(&state, &reports);
+    let monitor = build_monitor_stats(state, &reports);
     drop(reports);
 
-    Json(ScanMeta {
+    ScanMeta {
         routes: total,
         score: avg_score,
         monitor,
-    })
+    }
+}
+
+/// GET /api/scan-meta — return current scan statistics
+pub async fn get_scan_meta(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(compute_scan_meta(&state).await)
 }
 
 /// POST /api/reports/rescan — clear all reports and re-queue everything
@@ -297,13 +320,18 @@ pub async fn rescan_all(State(state): State<Arc<AppState>>) -> impl IntoResponse
     let count = reports.len();
     info!("Rescan all: clearing {count} reports");
 
-    // Collect routes to re-queue
-    let routes: Vec<_> = reports.values().map(|r| r.route.clone()).collect();
+    // Collect routes and artifact paths to invalidate cached report.json before re-queuing
+    let items: Vec<_> = reports
+        .values()
+        .map(|r| (r.route.clone(), r.artifact_path.clone()))
+        .collect();
     reports.clear();
     drop(reports);
 
-    // Re-queue via the work channel
-    for route in routes {
+    // Remove cached report.json and re-queue via the work channel
+    for (route, artifact_path) in items {
+        let cached_report = std::path::PathBuf::from(&artifact_path).join("report.json");
+        let _ = tokio::fs::remove_file(cached_report).await;
         let _ = state.work_tx.send(route).await;
     }
 
@@ -319,7 +347,10 @@ pub async fn rescan_one(
     if let Some(report) = reports.remove(&id) {
         info!("Rescan: re-queuing {}", report.route.path);
         let route = report.route.clone();
+        let artifact_path = report.artifact_path.clone();
         drop(reports);
+        let cached_report = std::path::PathBuf::from(&artifact_path).join("report.json");
+        let _ = tokio::fs::remove_file(cached_report).await;
         let _ = state.work_tx.send(route).await;
         StatusCode::OK
     } else {

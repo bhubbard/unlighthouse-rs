@@ -80,8 +80,46 @@ fn path_matches(path: &str, pattern: &str) -> bool {
 pub async fn resolve_reportable_routes(
     config: &Config,
 ) -> Result<(Vec<NormalisedRoute>, reqwest::Client, Vec<RobotsRule>)> {
+    let ua = config
+        .user_agent
+        .as_deref()
+        .unwrap_or("Mozilla/5.0 (compatible; unlighthouse-rs/0.1)");
+
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Some(ref extra_headers) = config.extra_headers {
+        for (k, v) in extra_headers {
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                default_headers.insert(name, val);
+            }
+        }
+    }
+    if let Some(ref cookies) = config.cookies {
+        if !cookies.is_empty() {
+            let cookie_str = cookies
+                .iter()
+                .map(|c| format!("{}={}", c.name, c.value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&cookie_str) {
+                default_headers.insert(reqwest::header::COOKIE, val);
+            }
+        }
+    }
+    if let Some(ref auth) = config.auth {
+        use base64::Engine;
+        let credentials = format!("{}:{}", auth.username, auth.password);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Basic {encoded}")) {
+            default_headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+    }
+
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (compatible; unlighthouse-rs/0.1)")
+        .user_agent(ua)
+        .default_headers(default_headers)
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 

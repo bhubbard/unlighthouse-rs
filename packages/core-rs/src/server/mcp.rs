@@ -272,7 +272,10 @@ pub async fn handle_mcp_request(state: &Arc<AppState>, request: &Value) -> Value
                         if let Some(rid) = found_id {
                             if let Some(report) = reports.remove(&rid) {
                                 let route = report.route.clone();
+                                let artifact_path = report.artifact_path.clone();
                                 drop(reports);
+                                let cached_report = std::path::PathBuf::from(&artifact_path).join("report.json");
+                                let _ = tokio::fs::remove_file(cached_report).await;
                                 let _ = state.work_tx.send(route).await;
                                 json!({
                                     "jsonrpc": "2.0",

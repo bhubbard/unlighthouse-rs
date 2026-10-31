@@ -47,6 +47,8 @@ pub struct AppState {
     pub run_id: String,
     /// Monotonic start time of the scan.
     pub start_time: std::time::Instant,
+    /// Robots.txt disallow rules collected during initial discovery, enforced on crawled links.
+    pub robots_rules: RwLock<Vec<crate::discovery::robots_txt::RobotsRule>>,
 }
 
 impl AppState {
@@ -71,6 +73,7 @@ impl AppState {
             db,
             run_id,
             start_time: std::time::Instant::now(),
+            robots_rules: RwLock::new(Vec::new()),
         }
     }
 }
@@ -190,14 +193,20 @@ async fn index_handler(State(state): State<Arc<AppState>>) -> Response {
     let addr: SocketAddr = format!("{}:{}", state.config.host, state.config.port)
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:5678".parse().unwrap());
-    let payload = build_payload(&state.config, addr);
+    let mut payload = build_payload(&state.config, addr);
+    let reports: Vec<RouteReport> = {
+        let r = state.route_reports.read().await;
+        r.values().cloned().collect()
+    };
+    let scan_meta = api::compute_scan_meta(&state).await;
+    payload["reports"] = serde_json::to_value(&reports).unwrap_or_else(|_| serde_json::json!([]));
+    payload["scanMeta"] = serde_json::to_value(&scan_meta).unwrap_or(serde_json::Value::Null);
+
     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
     let script = format!(
         "<script>\nwindow.__unlighthouse_payload = {payload_json};\nwindow.__unlighthouse_static = false;\n</script>"
     );
-
-    // Inject before </head> (or prepend to <body> as a fallback)
 
     // Inject before </head> (or prepend to <body> as a fallback)
     let injected = if html.contains("</head>") {
@@ -400,6 +409,65 @@ pub async fn start_server(
     Ok(())
 }
 
+/// Export a self-contained static dashboard into `{output_path}/client/` with
+/// `window.__unlighthouse_static = true` and `window.__unlighthouse_payload`
+/// pre-populated with all route reports and scan metadata.
+pub async fn write_static_client(state: &Arc<AppState>) -> anyhow::Result<PathBuf> {
+    let client_dir = PathBuf::from(&state.config.output_path).join("client");
+    tokio::fs::create_dir_all(&client_dir).await?;
+
+    // Extract any embedded client assets that are not already present on disk
+    for asset_path in Assets::iter() {
+        let rel = asset_path.as_ref();
+        let dest = client_dir.join(rel);
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            if let Some(file) = Assets::get(rel) {
+                tokio::fs::write(&dest, file.data.as_ref()).await?;
+            }
+        }
+    }
+
+    let index_path = client_dir.join("index.html");
+    let base_html = match tokio::fs::read_to_string(&index_path).await {
+        Ok(h) => h,
+        Err(_) => match Assets::get("index.html") {
+            Some(embedded) => String::from_utf8_lossy(&embedded.data).to_string(),
+            None => "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>UnLighthouse-RS</title></head><body><div id=\"app\"></div></body></html>".to_string(),
+        },
+    };
+
+    // Strip any previously injected __unlighthouse_payload script block before re-injecting
+    let addr: SocketAddr = format!("{}:{}", state.config.host, state.config.port)
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:5678".parse().unwrap());
+    let mut payload = build_payload(&state.config, addr);
+    let mut reports: Vec<RouteReport> = {
+        let r = state.route_reports.read().await;
+        r.values().cloned().collect()
+    };
+    reports.sort_by(|a, b| a.route.path.cmp(&b.route.path));
+    let scan_meta = api::compute_scan_meta(state).await;
+    payload["reports"] = serde_json::to_value(&reports)?;
+    payload["scanMeta"] = serde_json::to_value(&scan_meta)?;
+
+    let payload_json = serde_json::to_string(&payload)?;
+    let script = format!(
+        "<script>\nwindow.__unlighthouse_payload = {payload_json};\nwindow.__unlighthouse_static = true;\n</script>"
+    );
+
+    let injected = if base_html.contains("</head>") {
+        base_html.replacen("</head>", &format!("{script}\n</head>"), 1)
+    } else {
+        format!("{script}\n{base_html}")
+    };
+
+    tokio::fs::write(&index_path, injected).await?;
+    Ok(index_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +588,39 @@ mod tests {
             asset_resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=31536000, immutable"
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_static_client_and_payload_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("static.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+
+        let config = Arc::new(Config {
+            site: "https://static.example.com".to_string(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            ..Default::default()
+        });
+        let (work_tx, _work_rx) = tokio::sync::mpsc::channel(8);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            work_tx,
+            None,
+            db,
+            "run-static".to_string(),
+        ));
+
+        let route = crate::discovery::routes::normalise_route("/about", &config.site);
+        let mut rep = crate::queue::worker::create_route_report(&route, &config);
+        rep.tasks.inspect_html_task = crate::types::TaskStatus::Completed;
+        rep.tasks.run_lighthouse_task = crate::types::TaskStatus::Completed;
+        state.route_reports.write().await.insert(route.id.clone(), rep);
+
+        let index_path = write_static_client(&state).await.unwrap();
+        assert!(index_path.exists());
+        let html = tokio::fs::read_to_string(&index_path).await.unwrap();
+        assert!(html.contains("window.__unlighthouse_static = true;"));
+        assert!(html.contains("\"https://static.example.com/about\""));
+        assert!(html.contains("\"scanMeta\""));
     }
 }

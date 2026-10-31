@@ -97,16 +97,42 @@ pub async fn process_route(
 
                 if config.scanner.crawler {
                     let max = config.scanner.max_routes.unwrap_or(usize::MAX);
+                    let robots_rules = state.robots_rules.read().await;
                     let mut reports = state.route_reports.write().await;
                     for href in discovered_links {
                         if reports.len() >= max {
                             break;
                         }
+                        if !crate::util::is_same_origin(&config.site, &href) {
+                            continue;
+                        }
                         let new_route = normalise_route(&href, &config.site);
-                        if crate::discovery::routes::passes_filters(&new_route.path, &config.scanner.include, &config.scanner.exclude)
-                            && !reports.contains_key(&new_route.id)
+                        if !crate::util::is_html_path(&new_route.path) {
+                            continue;
+                        }
+                        if let Some(rule) = crate::discovery::robots_txt::match_path_to_rule(
+                            &new_route.path,
+                            &robots_rules,
+                        ) {
+                            if !rule.allow {
+                                debug!(
+                                    path = %new_route.path,
+                                    pattern = %rule.pattern,
+                                    "Skipping crawled route (robots.txt disallow)"
+                                );
+                                continue;
+                            }
+                        }
+                        if crate::discovery::routes::passes_filters(
+                            &new_route.path,
+                            &config.scanner.include,
+                            &config.scanner.exclude,
+                        ) && !reports.contains_key(&new_route.id)
                         {
-                            reports.insert(new_route.id.clone(), create_route_report(&new_route, &config));
+                            reports.insert(
+                                new_route.id.clone(),
+                                create_route_report(&new_route, &config),
+                            );
                             let _ = state.work_tx.send(new_route).await;
                         }
                     }
@@ -158,73 +184,127 @@ pub async fn process_route(
                 }
             }
         } else {
-            // ── Full mode: run Lighthouse Node.js subprocess ─────────────────
+            // ── Full mode: run Lighthouse Node.js subprocess (with cache & multi-sample support) ──
             let artifact_path = PathBuf::from(&report.artifact_path);
+            let json_path = artifact_path.join("report.json");
 
-            if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
+            let cached = if config.cache && json_path.exists() {
+                tokio::fs::read_to_string(&json_path)
+                    .await
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                    .and_then(|val| parse_lighthouse_report(&val).ok())
+            } else {
+                None
+            };
+
+            if let Some(cached_report) = cached {
+                info!(
+                    path  = %route.path,
+                    score = cached_report.score * 100.0,
+                    "Loaded cached Lighthouse report"
+                );
+                report.report = Some(cached_report);
+                report.tasks.run_lighthouse_task = TaskStatus::Completed;
+            } else if let Err(e) = tokio::fs::create_dir_all(&artifact_path).await {
                 error!("Cannot create artifact dir {:?}: {e}", artifact_path);
                 report.tasks.run_lighthouse_task = TaskStatus::Failed;
             } else {
-                // Use the pool if available, otherwise fallback to one-off
-                let res = if let Some(pool) = &state.lighthouse_pool {
-                    let worker = pool.acquire_worker().await;
-                    let mut worker = worker.lock().await;
+                let total_samples = config.scanner.samples.max(1);
+                let mut collected_samples: Vec<(LighthouseReport, String)> =
+                    Vec::with_capacity(total_samples);
+                let mut last_err: Option<String> = None;
 
-                    let device_str = match config.scanner.device {
-                        crate::config::Device::Desktop => "desktop",
-                        _ => "mobile",
+                for sample_idx in 0..total_samples {
+                    if total_samples > 1 {
+                        debug!(
+                            path = %route.path,
+                            sample = sample_idx + 1,
+                            total_samples,
+                            "Running Lighthouse sample"
+                        );
+                    }
+
+                    let res = if let Some(pool) = &state.lighthouse_pool {
+                        let worker = pool.acquire_worker().await;
+                        let mut worker = worker.lock().await;
+
+                        let device_str = match config.scanner.device {
+                            crate::config::Device::Desktop => "desktop",
+                            _ => "mobile",
+                        };
+
+                        worker
+                            .audit(crate::queue::pool::AuditTask {
+                                url: route.url.clone(),
+                                output_dir: report.artifact_path.clone(),
+                                device: device_str.to_string(),
+                                throttle: config.scanner.throttle,
+                                skip_javascript: config.scanner.skip_javascript,
+                                block_assets: config.scanner.block_assets,
+                                warmup: config.scanner.warmup,
+                                auth: config.auth.clone(),
+                                cookies: config.cookies.clone(),
+                                local_storage: config.local_storage.clone(),
+                                session_storage: config.session_storage.clone(),
+                                extra_headers: config.extra_headers.clone(),
+                                user_agent: config.user_agent.clone(),
+                            })
+                            .await
+                    } else {
+                        run_lighthouse_fallback(&route.url, &artifact_path, &config)
+                            .await
+                            .map(|r| crate::queue::pool::AuditResult {
+                                success: true,
+                                url: route.url.clone(),
+                                scores: Some(
+                                    r.categories
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), v.score.unwrap_or(0.0)))
+                                        .collect(),
+                                ),
+                                error: None,
+                            })
                     };
 
-                    worker.audit(crate::queue::pool::AuditTask {
-                        url: route.url.clone(),
-                        output_dir: report.artifact_path.clone(),
-                        device: device_str.to_string(),
-                        throttle: config.scanner.throttle,
-                        skip_javascript: config.scanner.skip_javascript,
-                        block_assets: config.scanner.block_assets,
-                        warmup: config.scanner.warmup,
-                        auth: config.auth.clone(),
-                        cookies: config.cookies.clone(),
-                        local_storage: config.local_storage.clone(),
-                        session_storage: config.session_storage.clone(),
-                        extra_headers: config.extra_headers.clone(),
-                        user_agent: config.user_agent.clone(),
-                    }).await
-                } else {
-                    run_lighthouse_fallback(&route.url, &artifact_path, &config).await
-                        .map(|r| crate::queue::pool::AuditResult {
-                            success: true,
-                            url: route.url.clone(),
-                            scores: Some(r.categories.iter().map(|(k, v)| (k.clone(), v.score.unwrap_or(0.0))).collect()),
-                            error: None,
-                        })
-                };
-
-                match res {
-                    Ok(audit_res) if audit_res.success => {
-                        let json_path = artifact_path.join("report.json");
-                        if let Ok(json) = tokio::fs::read_to_string(json_path).await {
-                            if let Ok(serde_val) = serde_json::from_str::<serde_json::Value>(&json) {
-                                if let Ok(lh_report) = parse_lighthouse_report(&serde_val) {
-                                    report.report = Some(lh_report);
+                    match res {
+                        Ok(audit_res) if audit_res.success => {
+                            if let Ok(json) = tokio::fs::read_to_string(&json_path).await {
+                                if let Ok(serde_val) =
+                                    serde_json::from_str::<serde_json::Value>(&json)
+                                {
+                                    if let Ok(lh_report) = parse_lighthouse_report(&serde_val) {
+                                        collected_samples.push((lh_report, json));
+                                    }
                                 }
                             }
                         }
-                        report.tasks.run_lighthouse_task = TaskStatus::Completed;
-                        info!(
-                            path  = %route.path,
-                            score = report.report.as_ref().map(|r| r.score * 100.0).unwrap_or(0.0),
-                            "Lighthouse complete"
-                        );
+                        Ok(audit_res) => {
+                            last_err = audit_res.error.or_else(|| Some("Lighthouse failed".into()));
+                        }
+                        Err(e) => {
+                            last_err = Some(e.to_string());
+                        }
                     }
-                    Ok(audit_res) => {
-                        warn!(url = %route.url, error = ?audit_res.error, "Lighthouse failed");
-                        report.tasks.run_lighthouse_task = TaskStatus::Failed;
+                }
+
+                if let Some((median_report, median_json)) = select_median_report(collected_samples)
+                {
+                    if total_samples > 1 {
+                        let _ = tokio::fs::write(&json_path, median_json).await;
                     }
-                    Err(e) => {
-                        warn!(url = %route.url, error = %e, "Lighthouse pool audit failed");
-                        report.tasks.run_lighthouse_task = TaskStatus::Failed;
-                    }
+                    let score_pct = median_report.score * 100.0;
+                    report.report = Some(median_report);
+                    report.tasks.run_lighthouse_task = TaskStatus::Completed;
+                    info!(
+                        path    = %route.path,
+                        score   = score_pct,
+                        samples = total_samples,
+                        "Lighthouse complete"
+                    );
+                } else {
+                    warn!(url = %route.url, error = ?last_err, "Lighthouse failed");
+                    report.tasks.run_lighthouse_task = TaskStatus::Failed;
                 }
             }
         }
@@ -242,11 +322,50 @@ pub async fn process_route(
         }
     }
 
-    {
+    let maybe_finished_count = {
         let mut reports = state.route_reports.write().await;
         reports.insert(route.id.clone(), report.clone());
+
+        let all_done = !reports.is_empty()
+            && reports.values().all(|r| {
+                matches!(
+                    r.tasks.run_lighthouse_task,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Ignore
+                )
+            });
+
+        if all_done {
+            Some(reports.len() as i64)
+        } else {
+            None
+        }
+    };
+
+    if let Some(total_routes) = maybe_finished_count {
+        if let Err(e) =
+            crate::db::finish_run(&state.db, &state.run_id, total_routes).await
+        {
+            warn!(error = %e, "Failed to mark scan run as finished in DB");
+        }
     }
+
     broadcast_and_update(&state, WsEvent::TaskComplete(report)).await;
+}
+
+/// Select the median sample by overall `LighthouseReport::score`.
+pub fn select_median_report(
+    mut samples: Vec<(LighthouseReport, String)>,
+) -> Option<(LighthouseReport, String)> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| {
+        a.0.score
+            .partial_cmp(&b.0.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mid = samples.len() / 2;
+    Some(samples.swap_remove(mid))
 }
 
 // ── Lighthouse subprocess ─────────────────────────────────────────────────────
@@ -380,9 +499,16 @@ pub async fn run_worker_loop(
     info!(concurrency = state.config.workers, "Worker loop started");
 
     while let Some(route) = work_rx.recv().await {
-        // Skip if already registered (dedup)
-        if state.route_reports.read().await.contains_key(&route.id) {
-            debug!(path = %route.path, "Skipping already-queued route");
+        // Skip only if already started or finished (pre-registered routes have Waiting status)
+        let already_started = state
+            .route_reports
+            .read()
+            .await
+            .get(&route.id)
+            .map(|r| r.tasks.inspect_html_task != TaskStatus::Waiting)
+            .unwrap_or(false);
+        if already_started {
+            debug!(path = %route.path, "Skipping already-started route");
             continue;
         }
 
@@ -503,5 +629,112 @@ mod tests {
 
         let reports = state.route_reports.read().await;
         assert_eq!(reports.len(), 2); // root + pre-registered /discovered
+    }
+
+    #[tokio::test]
+    async fn test_select_median_report_and_artifact_cache_and_robots_filter() {
+        // 1. Test select_median_report picks the middle score
+        assert!(select_median_report(vec![]).is_none());
+        let mk_sample = |score: f64, tag: &str| {
+            let rep = LighthouseReport {
+                score,
+                categories: std::collections::HashMap::new(),
+                audits: json!({}),
+            };
+            (rep, tag.to_string())
+        };
+        let (median_rep, median_tag) = select_median_report(vec![
+            mk_sample(0.95, "high"),
+            mk_sample(0.50, "low"),
+            mk_sample(0.80, "mid"),
+        ])
+        .unwrap();
+        assert!((median_rep.score - 0.80).abs() < 1e-6);
+        assert_eq!(median_tag, "mid");
+
+        // 2. Test artifact cache hit + crawler robots.txt disallow filtering + finish_run
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let site = format!("http://{addr}");
+
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                r#"<html><head><title>Home</title></head>
+                <body>
+                    <a href="/disallowed-by-robots">Blocked</a>
+                    <a href="/file.pdf">PDF</a>
+                </body></html>"#
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cache.db");
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        crate::db::insert_run(&db, "run-cache", &site, "full")
+            .await
+            .unwrap();
+
+        let cfg = Config {
+            site: site.clone(),
+            output_path: dir.path().to_str().unwrap().to_string(),
+            mode: ScanMode::Full,
+            cache: true,
+            ..Default::default()
+        };
+        let config = Arc::new(cfg);
+
+        // Pre-populate cached report.json on disk for root route
+        let root_route = normalise_route(&format!("{site}/"), &site);
+        let init_rep = create_route_report(&root_route, &config);
+        let artifact_dir = PathBuf::from(&init_rep.artifact_path);
+        tokio::fs::create_dir_all(&artifact_dir).await.unwrap();
+        tokio::fs::write(
+            artifact_dir.join("report.json"),
+            serde_json::to_string(&json!({
+                "categories": {
+                    "performance": { "score": 0.92, "title": "Performance" }
+                },
+                "audits": {}
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (work_tx, mut work_rx) = tokio::sync::mpsc::channel(16);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            work_tx,
+            None,
+            db.clone(),
+            "run-cache".to_string(),
+        ));
+        *state.robots_rules.write().await = vec![crate::discovery::robots_txt::RobotsRule {
+            pattern: "/disallowed".to_string(),
+            allow: false,
+        }];
+
+        let browser = launch_reqwest(&config).unwrap();
+        process_route(root_route.clone(), Arc::clone(&state), browser).await;
+
+        // Neither /disallowed-by-robots nor /file.pdf should be queued
+        assert!(work_rx.try_recv().is_err());
+
+        // Cached report should be loaded without needing a Lighthouse worker process
+        let reports = state.route_reports.read().await;
+        let finished_rep = reports.get(&root_route.id).unwrap();
+        assert_eq!(finished_rep.tasks.run_lighthouse_task, TaskStatus::Completed);
+        assert!((finished_rep.report.as_ref().unwrap().score - 0.92).abs() < 1e-6);
+        drop(reports);
+
+        // Run in SQLite should now be marked finished with route_count=1
+        let runs = crate::db::list_runs(&db, &site, 5).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].finished_at.is_some());
+        assert_eq!(runs[0].route_count, Some(1));
     }
 }

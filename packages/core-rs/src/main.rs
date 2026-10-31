@@ -211,10 +211,12 @@ struct Cli {
         anyhow::bail!("--site is required. Provide a URL like https://example.com");
     }
 
+    let is_batch_mode = config.ci.enabled || config.ci.build_static;
+
     // If running in normal server mode, bind to the port early to fail fast
     // if the address is already in use, preventing unnecessary heavy initialization.
     // Try up to 10 fallback ports if the primary port is busy.
-    let listener = if !config.ci.enabled && !cli.mcp {
+    let listener = if !is_batch_mode && !cli.mcp {
         let mut port = config.port;
         let mut listener = None;
         let max_port = port + 10;
@@ -354,12 +356,23 @@ struct Cli {
 
     // ── Route discovery (uses reqwest — no browser needed for sitemaps/robots) ─
     info!("Starting route discovery...");
-    let (initial_routes, _disc_client, _robots_rules) =
+    let (initial_routes, _disc_client, robots_rules) =
         resolve_reportable_routes(&config).await.context("Route discovery failed")?;
 
     info!("Discovered {} initial routes", initial_routes.len());
+    *state.robots_rules.write().await = robots_rules;
 
-    // Queue all discovered routes
+    // Pre-register and queue all discovered routes so CI mode and /api/reports
+    // see the full initial queue before workers begin processing.
+    {
+        let mut reports = state.route_reports.write().await;
+        for route in &initial_routes {
+            reports.insert(
+                route.id.clone(),
+                unlighthouse_rs::queue::worker::create_route_report(route, &config),
+            );
+        }
+    }
     for route in &initial_routes {
         let _ = work_tx.send(route.clone()).await;
     }
@@ -371,8 +384,8 @@ struct Cli {
         run_worker_loop(worker_state, worker_browser, work_rx).await;
     });
 
-    // ── CI mode: no server, wait for completion, write report, exit ──────────
-    if config.ci.enabled {
+    // ── CI / static build mode: no server, wait for completion, write report, exit ─
+    if is_batch_mode {
         return run_ci_mode(state, config, worker_handle).await;
     }
 
@@ -407,15 +420,15 @@ async fn run_ci_mode(
     info!("CI mode: waiting for all scans to complete...");
 
     // Poll until all routes are done
+    let mut ticks = 0usize;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        ticks += 1;
 
         let reports = state.route_reports.read().await;
         if reports.is_empty() {
-            // Nothing queued yet — wait a bit
-            drop(reports);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            continue;
+            warn!("No routes matched filters or were discovered.");
+            break;
         }
 
         let all_done = reports.values().all(|r| {
@@ -430,18 +443,20 @@ async fn run_ci_mode(
             break;
         }
 
-        let done = reports
-            .values()
-            .filter(|r| {
-                matches!(
-                    r.tasks.run_lighthouse_task,
-                    TaskStatus::Completed | TaskStatus::Failed
-                )
-            })
-            .count();
-        let total = reports.len();
-        drop(reports);
-        info!("Progress: {done}/{total}");
+        if ticks.is_multiple_of(20) {
+            let done = reports
+                .values()
+                .filter(|r| {
+                    matches!(
+                        r.tasks.run_lighthouse_task,
+                        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Ignore
+                    )
+                })
+                .count();
+            let total = reports.len();
+            drop(reports);
+            info!("Progress: {done}/{total}");
+        }
     }
 
     worker_handle.abort();
@@ -450,6 +465,19 @@ async fn run_ci_mode(
         let r = state.route_reports.read().await;
         r.values().cloned().collect()
     };
+
+    // Finalize run summary in SQLite
+    if let Err(e) = db::finish_run(&state.db, &state.run_id, reports.len() as i64).await {
+        warn!("Failed to finalize run in SQLite: {e}");
+    }
+
+    // Export static client bundle if --build-static / ci.build_static is enabled
+    if config.ci.build_static {
+        match unlighthouse_rs::server::write_static_client(&state).await {
+            Ok(index_path) => info!("Static client built: {:?}", index_path),
+            Err(e) => error!("Failed to build static client: {e}"),
+        }
+    }
 
     // Write report
     if config.ci.reporter != ReporterType::None {
